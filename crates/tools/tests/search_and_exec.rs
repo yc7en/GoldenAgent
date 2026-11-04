@@ -389,3 +389,60 @@ async fn bash_missing_command_argument_is_reported() {
         .expect_err("缺 command 必须报错");
     assert!(err.to_string().contains("command"), "{err}");
 }
+
+// ─────────────────────── 输出编码（B19） ───────────────────────
+
+/// 中文文件名过一轮 `dir` 回来必须还是原样。
+///
+/// 这条走的是 cmd 最顽固的那条路径：`dir /b` 不带通配符时按 ANSI 代码页写字节，
+/// 光靠 `chcp 65001` 治不好，必须靠解码侧兜底。
+#[cfg(windows)]
+#[tokio::test]
+async fn bash_decodes_chinese_filenames_from_dir() {
+    let ws = TempWorkspace::new();
+    ws.write("中文文件.md", "x");
+    ws.write("子目录/说明.txt", "x");
+
+    let out = registry()
+        .run("bash", json!({ "command": "dir /b 2>&1" }), &ws.ctx())
+        .await
+        .unwrap();
+
+    assert!(out.contains("中文文件.md"), "文件名不能被解成乱码: {out}");
+    assert!(out.contains("子目录"), "目录名不能被解成乱码: {out}");
+    assert!(!out.contains('\u{FFFD}'), "输出里不该出现替换字符: {out}");
+}
+
+/// stdout 与 stderr 各自解码：两段可能是不同编码，不能拼起来一起判。
+#[tokio::test]
+async fn bash_keeps_chinese_output_and_stderr_intact() {
+    let ws = TempWorkspace::new();
+    #[cfg(windows)]
+    let command = "echo 中文输出 & echo 中文错误 1>&2";
+    #[cfg(not(windows))]
+    let command = "echo 中文输出; echo 中文错误 1>&2";
+
+    let out = registry()
+        .run("bash", json!({ "command": command }), &ws.ctx())
+        .await
+        .unwrap();
+
+    assert!(out.contains("中文输出"), "{out}");
+    assert!(out.contains("中文错误"), "{out}");
+    assert!(!out.contains('\u{FFFD}'), "输出里不该出现替换字符: {out}");
+}
+
+/// 前缀是 `&` 不是 `&&`，所以用户自己串联的多条命令语义不变。
+#[cfg(windows)]
+#[tokio::test]
+async fn bash_prefix_does_not_eat_the_command_chain() {
+    let ws = TempWorkspace::new();
+    let out = registry()
+        .run("bash", json!({ "command": "echo first & echo second" }), &ws.ctx())
+        .await
+        .unwrap();
+
+    assert!(out.contains("退出码 0"), "{out}");
+    assert!(out.contains("first"), "{out}");
+    assert!(out.contains("second"), "{out}");
+}

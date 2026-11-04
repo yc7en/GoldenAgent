@@ -106,11 +106,14 @@ impl Tool for Bash {
         };
 
         let mut body = String::new();
-        let stdout = String::from_utf8_lossy(&raw_stdout);
+        // 不能直接 `from_utf8_lossy`：Windows 上命令输出的编码不止一种，
+        // 解错了会变成一串 `�`，模型拿到乱码文件名后再也拼不回正确路径。
+        // 判定顺序见 encoding.rs。
+        let stdout = crate::encoding::decode(&raw_stdout);
         if !stdout.trim().is_empty() {
             body.push_str(&stdout);
         }
-        let stderr = String::from_utf8_lossy(&raw_stderr);
+        let stderr = crate::encoding::decode(&raw_stderr);
         if !stderr.trim().is_empty() {
             if !body.is_empty() {
                 body.push('\n');
@@ -189,8 +192,18 @@ fn shell_command(command: &str) -> tokio::process::Command {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+        // 先把控制台代码页切成 UTF-8，否则 cmd 的内置命令按系统 OEM 代码页
+        // 写字节（中文 Windows 上是 936），下游按 UTF-8 解必然乱码。
+        //
+        // - `> nul` 不能省，不然那句 "Active code page: 65001" 会混进命令输出；
+        // - 用 `&` 而不是 `&&`：切换代码页失败也轮不到它来拦用户的命令。
+        //
+        // 这招治不了全部（`dir /b` 不带参数时 cmd 仍走 ANSI 老路径），
+        // 剩下的由 encoding::decode 兜底。
+        let script = format!("chcp 65001 > nul & {command}");
+
         let mut cmd = std::process::Command::new("cmd");
-        cmd.arg("/C").arg(command);
+        cmd.arg("/C").arg(script);
         cmd.creation_flags(CREATE_NO_WINDOW);
         cmd
     };

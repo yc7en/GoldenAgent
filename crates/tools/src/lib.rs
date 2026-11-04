@@ -10,6 +10,7 @@
 pub mod jail;
 
 mod bash;
+mod encoding;
 mod glob;
 mod grep;
 mod list_dir;
