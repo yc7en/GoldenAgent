@@ -167,7 +167,14 @@ pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 /// 低于这个值几乎一定被截断，不如直接拒掉——用户会以为是模型不听话。
 pub const MIN_MAX_TOKENS: u32 = 256;
 /// 上限。再大只是让"截断"来得更晚，而钱是照花的。
-pub const MAX_MAX_TOKENS: u32 = 32768;
+///
+/// 取 131072 是因为主流模型的实际输出上限已经越过 32768：
+/// Claude 系列 64K、Gemini 2.5 65K、DeepSeek reasoner 64K。
+/// 原来卡在 32768 会把"模型支持、但这里不许填"变成一个说不清的限制，
+/// 而**超限时又是静默夹取**——用户填 64000、界面回显 32768，
+/// 只剩"保存不了"这一个观感。上限仍然要有（挡住 99999999 这类手误），
+/// 但不能低于厂商的实际能力。
+pub const MAX_MAX_TOKENS: u32 = 131072;
 
 impl Default for ProviderConfig {
     fn default() -> Self {

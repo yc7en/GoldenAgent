@@ -215,7 +215,7 @@ B0–B17 全部完成。能力范围：
 验证状态：
 
 - `npm run verify` —— 退出码 0（门禁 R1–R5 + 版本一致性 + 全量测试 + 前端构建）
-- `cargo test --workspace` —— **240 用例全过，无代码警告**（Windows 的增量编译锁文件
+- `cargo test --workspace` —— **243 用例全过，无代码警告**（Windows 的增量编译锁文件
   警告是环境噪音，不计入）
 - `npm run tauri build` —— 通过，产出 NSIS 安装包（`GoldenAgent_0.1.0_x64-setup.exe`，2.58 MiB）
 - `npm run bundle:size` —— 在预算内（主程序 11.15 / 20 MiB，安装包 2.58 / 10 MiB）

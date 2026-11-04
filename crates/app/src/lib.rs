@@ -16,7 +16,9 @@ use std::time::Duration;
 use goldenagent_core::{Error, Result};
 use goldenagent_loop::{AgentLoop, Cancellation, Config};
 use goldenagent_policy::Policy;
-use goldenagent_provider::{MockProvider, Provider, ProviderConfig};
+use goldenagent_provider::{
+    MockProvider, Provider, ProviderConfig, MAX_MAX_TOKENS, MIN_MAX_TOKENS,
+};
 use goldenagent_session::{Session, SessionCatalog, SessionStore, SpaceStore};
 use goldenagent_tools::Registry;
 use tokio::sync::Mutex;
@@ -328,6 +330,8 @@ impl AgentService {
             model: runtime.model.clone(),
             base_url: runtime.config.base_url.clone().unwrap_or_default(),
             max_tokens: runtime.max_tokens,
+            max_tokens_min: MIN_MAX_TOKENS,
+            max_tokens_max: MAX_MAX_TOKENS,
             config_path: runtime
                 .path
                 .clone()

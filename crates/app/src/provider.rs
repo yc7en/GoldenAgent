@@ -102,6 +102,11 @@ pub struct ProviderSetup {
     /// 单次回答的输出上限。界面要显示它——推理模型的用户
     /// 看到"额度全用在思考上"的报错时，得知道去哪儿改。
     pub max_tokens: u32,
+    /// 允许的取值范围。界面拿它渲染输入框的 `min` / `max`，
+    /// 而不是自己写死一份——两处常量各说一套时，用户会撞上一个
+    /// "表单接受、后端改掉"的黑洞（32768 那次就是这么来的）。
+    pub max_tokens_min: u32,
+    pub max_tokens_max: u32,
     /// 配置文件路径。界面要把它显示出来——用户得知道该改哪个文件。
     pub config_path: PathBuf,
     /// 从环境变量探测到的 key 变量名（不是值）。`None` 表示没探测到。
@@ -225,8 +230,22 @@ pub(crate) fn save(
             .map(str::trim)
             .filter(|url| !url.is_empty())
             .map(str::to_string),
-        timeout_secs: input.timeout_secs.unwrap_or(180).clamp(10, 1800),
-        max_retries: input.max_retries.unwrap_or(2).min(6),
+        // 界面没暴露的字段一律**沿用旧值**，不能填默认值。
+        //
+        // 之前这里写的是 `unwrap_or(180)` / `.unwrap_or(2)` / `.unwrap_or(true)`：
+        // 表单不提交这三项，于是每点一次"保存"就把用户手改过的
+        // `timeout_secs: 600`、`stream: false` 冲回默认值。
+        // 表现是"我只是改了个最大输出，怎么流式自己开了"。
+        timeout_secs: input
+            .timeout_secs
+            .or_else(|| existing.map(|old| old.timeout_secs))
+            .unwrap_or(180)
+            .clamp(10, 1800),
+        max_retries: input
+            .max_retries
+            .or_else(|| existing.map(|old| old.max_retries))
+            .unwrap_or(2)
+            .min(6),
         // 夹住而不是拒绝：填 100 的用户是想"省点钱"，填 999999 的是想"别截断"，
         // 两种意图都能用边界值满足，报错只会让人卡在这里。
         max_tokens: input
@@ -234,7 +253,10 @@ pub(crate) fn save(
             .map(|value| value.clamp(MIN_MAX_TOKENS, MAX_MAX_TOKENS))
             .or_else(|| existing.map(|old| old.max_tokens))
             .unwrap_or(DEFAULT_MAX_TOKENS),
-        stream: input.stream.unwrap_or(true),
+        stream: input
+            .stream
+            .or_else(|| existing.map(|old| old.stream))
+            .unwrap_or(true),
     };
 
     config.build()?;

@@ -299,3 +299,117 @@ fn provider_setup_does_not_expose_api_key() {
     assert_eq!(setup.kind, "anthropic");
     assert_eq!(setup.model, "m");
 }
+
+/// 最大输出必须能被改掉、落盘、重启后还在。
+///
+/// 这条是"最大输出保存不了"的回归护栏。原来没有它，于是三种毛病一起存在：
+/// 上限卡在 32768（低于主流模型的实际能力）、超限静默夹取（界面上看不出发生了什么）、
+/// 以及表单不提交的字段被重置成默认值。
+#[test]
+fn save_provider_persists_max_tokens() {
+    let _env = env_guard();
+    clear_provider_env();
+    let dir = TempDir::new();
+    let path = dir.provider_json();
+
+    let service = AgentService::auto(AgentConfig::new(&dir.path), &path);
+    let setup = service
+        .save_provider(&ProviderInput {
+            kind: "openai".into(),
+            model: "deepseek-flash".into(),
+            api_key: Some("sk-test".into()),
+            base_url: Some("https://api.deepseek.com".into()),
+            max_tokens: Some(16384),
+            ..Default::default()
+        })
+        .expect("保存应成功");
+
+    assert_eq!(setup.max_tokens, 16384, "返回值要带上刚存的值");
+    assert!(
+        std::fs::read_to_string(&path).unwrap().contains("16384"),
+        "必须真的写进文件"
+    );
+
+    // 换一个 service 重新装配，模拟"关掉应用再打开"。
+    let reopened = AgentService::auto(AgentConfig::new(&dir.path), &path);
+    assert_eq!(
+        reopened.provider_setup().max_tokens,
+        16384,
+        "重启后还该是 16384"
+    );
+}
+
+/// 超上限不是"保存失败"，而是被按上限收下——并且把上限报出来。
+///
+/// 只断言"没有失败"是不够的：用户真正的困惑是"我填了 20000 以上，
+/// 它怎么就变成 32768 了"。所以这条同时锁住上限值本身。
+#[test]
+fn save_provider_clamps_max_tokens_and_reports_the_cap() {
+    let _env = env_guard();
+    clear_provider_env();
+    let dir = TempDir::new();
+    let path = dir.provider_json();
+
+    let service = AgentService::auto(AgentConfig::new(&dir.path), &path);
+    let setup = service
+        .save_provider(&ProviderInput {
+            kind: "openai".into(),
+            model: "m".into(),
+            api_key: Some("sk-test".into()),
+            max_tokens: Some(999_999),
+            ..Default::default()
+        })
+        .expect("超上限不该报错，只该被收下");
+
+    assert_eq!(setup.max_tokens, setup.max_tokens_max);
+    assert!(
+        setup.max_tokens_max >= 131_072,
+        "上限要能装下主流模型的输出能力（Claude 64K / Gemini 65K），现在是 {}",
+        setup.max_tokens_max
+    );
+
+    let low = service
+        .save_provider(&ProviderInput {
+            kind: "openai".into(),
+            model: "m".into(),
+            api_key: None,
+            max_tokens: Some(1),
+            ..Default::default()
+        })
+        .expect("低于下限也不该报错");
+    assert_eq!(low.max_tokens, low.max_tokens_min);
+}
+
+/// 表单没暴露的字段，保存时必须沿用旧值。
+///
+/// 原来的合并逻辑是 `unwrap_or(180)` / `.unwrap_or(2)` / `.unwrap_or(true)`：
+/// 界面上只有厂商/模型/Key/地址/最大输出五项，于是每点一次"保存"，
+/// 用户手改过的 `timeout_secs: 600` 和 `stream: false` 就被悄悄冲回默认值。
+#[test]
+fn save_provider_keeps_fields_the_form_does_not_send() {
+    let _env = env_guard();
+    clear_provider_env();
+    let dir = TempDir::new();
+    let path = dir.write(
+        r#"{"kind":"openai","model":"m","api_key":"sk-keep",
+            "timeout_secs":600,"max_retries":5,"stream":false,"max_tokens":4096}"#,
+    );
+
+    let service = AgentService::auto(AgentConfig::new(&dir.path), &path);
+    service
+        .save_provider(&ProviderInput {
+            kind: "openai".into(),
+            model: "m2".into(),
+            api_key: None,
+            base_url: Some("https://api.deepseek.com".into()),
+            // 只改模型名，其余五项都不提交
+            ..Default::default()
+        })
+        .expect("保存应成功");
+
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("\"timeout_secs\": 600"), "超时被重置了: {raw}");
+    assert!(raw.contains("\"max_retries\": 5"), "重试次数被重置了: {raw}");
+    assert!(raw.contains("\"stream\": false"), "流式开关被重置了: {raw}");
+    assert!(raw.contains("\"max_tokens\": 4096"), "最大输出被重置了: {raw}");
+}

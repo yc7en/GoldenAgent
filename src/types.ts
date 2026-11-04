@@ -86,6 +86,9 @@ export interface ProviderSetup {
   base_url: string;
   /** 单次回答的输出上限。推理模型的思考也吃这份额度。 */
   max_tokens: number;
+  /** 后端允许的取值区间。输入框的 min/max 用它，不在这里另写一份常量。 */
+  max_tokens_min: number;
+  max_tokens_max: number;
   config_path: string;
   /** 环境变量里探测到的 key 变量名（不是值）。 */
   env_key: string | null;

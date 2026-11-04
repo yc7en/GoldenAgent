@@ -717,6 +717,7 @@ export default function App() {
             setSettingsOpen(false);
             setSpaceDialog({ mode: "create" });
           }}
+          onNotice={notify}
         />
       )}
 

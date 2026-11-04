@@ -17,6 +17,8 @@ interface Props {
   onClose: () => void;
   onSaved: (setup: ProviderSetup) => void;
   onGoSpaces: () => void;
+  /** 保存后有话要说时走这里（例如数值被按上限收下）。 */
+  onNotice: (text: string) => void;
 }
 
 export default function SettingsSheet({
@@ -26,6 +28,7 @@ export default function SettingsSheet({
   onClose,
   onSaved,
   onGoSpaces,
+  onNotice,
 }: Props) {
   const [form, setForm] = useState({
     kind: setup?.kind ?? "anthropic",
@@ -41,6 +44,10 @@ export default function SettingsSheet({
 
   const providerState = snapshot?.provider_state ?? "unconfigured";
   const currentOption = setup?.catalog.find((option) => option.id === form.kind);
+  // 上下限由后端下发。写死一份常量的话，后端调了范围而界面不知道，
+  // 用户就会遇到"表单接受、保存后变了"——那正是 32768 那次的观感。
+  const tokenMin = setup?.max_tokens_min ?? 256;
+  const tokenMax = setup?.max_tokens_max ?? 131072;
   const keyPlaceholder =
     setup?.kind === form.kind && providerState === "ready"
       ? "留空表示不修改已保存的 Key"
@@ -53,6 +60,13 @@ export default function SettingsSheet({
     setSaving(true);
     setSaveError(null);
 
+    // 先在前端夹一次，是为了**把话说清楚**：后端也会夹（防手改文件），
+    // 但它夹完只返回结果，用户看不到"我填的为什么没生效"。
+    const typed = form.max_tokens.trim().length > 0 ? Number(form.max_tokens) : NaN;
+    const wanted = Number.isFinite(typed) ? Math.round(typed) : null;
+    const capped =
+      wanted === null ? null : Math.min(tokenMax, Math.max(tokenMin, wanted));
+
     try {
       const next = await api.saveProvider({
         kind: form.kind,
@@ -62,12 +76,14 @@ export default function SettingsSheet({
         api_key: form.api_key.length > 0 ? form.api_key : null,
         base_url: form.base_url.trim(),
         // 空框 = 不改。填了非数字也当"不改"，别把一个 NaN 发给后端。
-        max_tokens:
-          form.max_tokens.trim().length > 0 && Number.isFinite(Number(form.max_tokens))
-            ? Number(form.max_tokens)
-            : null,
+        max_tokens: capped,
       });
       onSaved(next);
+      // 被夹过就直说。静默夹取是这次"保存不了"的全部原因：
+      // 用户填 64000，界面回来 32768，中间没有任何一句话。
+      if (wanted !== null && capped !== wanted) {
+        onNotice(`最大输出按 ${capped} 保存（可填 ${tokenMin}–${tokenMax}，你填的是 ${wanted}）`);
+      }
     } catch (error) {
       setSaveError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -170,8 +186,8 @@ export default function SettingsSheet({
               <span>最大输出</span>
               <input
                 type="number"
-                min={256}
-                max={32768}
+                min={tokenMin}
+                max={tokenMax}
                 step={256}
                 value={form.max_tokens}
                 placeholder={String(setup?.max_tokens ?? 8192)}
@@ -181,8 +197,8 @@ export default function SettingsSheet({
               />
             </label>
             <p className="sheet-note">
-              推理模型的思考过程也占用这份额度。额度被思考吃光时，正文一个字都不会出现——
-              碰到"全用在思考上"的报错，先把它调大。
+              可填 {tokenMin}–{tokenMax}。超出范围会按边界值保存，并在这里告诉你。
+              推理模型的思考过程也占用这份额度——额度被思考吃光时，正文一个字都不会出现。
             </p>
 
             {saveError && <p className="sheet-error">{saveError}</p>}
