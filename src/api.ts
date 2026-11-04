@@ -71,10 +71,15 @@ export const api = {
 
   // 空间
   spaces: () => call<SpaceInfo[]>("spaces"),
-  createSpace: (name: string, path: string) =>
-    call<SpaceInfo>("create_space", { name, path }),
-  updateSpace: (id: string, name: string | null, path: string | null) =>
-    call<SpaceInfo>("update_space", { id, name, path }),
+  createSpace: (name: string, path: string, extraPaths: string[] = []) =>
+    call<SpaceInfo>("create_space", { name, path, extraPaths }),
+  /** `extraPaths: []` 表示清空附加目录；`null` 表示不动它。 */
+  updateSpace: (
+    id: string,
+    name: string | null,
+    path: string | null,
+    extraPaths: string[] | null = null,
+  ) => call<SpaceInfo>("update_space", { id, name, path, extraPaths }),
   deleteSpace: (id: string) => call<DeleteReport>("delete_space", { id }),
 
   // 搜索

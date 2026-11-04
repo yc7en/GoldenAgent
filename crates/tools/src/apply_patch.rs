@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use goldenagent_core::{Error, Result, ToolKind, ToolSpec};
 use serde_json::{json, Value};
 
-use crate::jail::{display_relative, resolve};
+use crate::jail::display_relative;
 use crate::write_file::MAX_WRITE_BYTES;
 use crate::{required_str, Tool, ToolContext};
 
@@ -53,7 +53,7 @@ impl Tool for ApplyPatch {
 
     async fn run(&self, input: Value, ctx: &ToolContext) -> Result<String> {
         let raw = required_str(&input, "path")?;
-        let path = resolve(&ctx.workspace, raw)?;
+        let path = ctx.resolve(raw)?;
         let edits = parse_edits(&input)?;
 
         if path.is_dir() {

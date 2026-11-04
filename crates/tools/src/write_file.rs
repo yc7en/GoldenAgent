@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use goldenagent_core::{Error, Result, ToolKind, ToolSpec};
 use serde_json::{json, Value};
 
-use crate::jail::{display_relative, resolve};
+use crate::jail::display_relative;
 use crate::{required_str, Tool, ToolContext};
 
 /// 单次写入的字节上限。防的是模型一次性吐出一份巨型文件把会话撑爆。
@@ -43,7 +43,7 @@ impl Tool for WriteFile {
             )));
         }
 
-        let path = resolve(&ctx.workspace, raw)?;
+        let path = ctx.resolve(raw)?;
 
         if path.is_dir() {
             return Err(Error::Tool(format!("{raw} 是目录，不能写入")));

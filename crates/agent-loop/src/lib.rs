@@ -125,7 +125,14 @@ impl AgentLoop {
         config: Config,
     ) -> Self {
         // 工作区只有 policy 一个来源，避免两处配置漂移。
-        let ctx = ToolContext::new(policy.workspace());
+        //
+        // 工具拿到的根集合必须与 policy 判定用的完全一致：两处各取一份，
+        // 就会出现"policy 放行、jail 拒绝"（或反过来）的分歧。
+        let roots = policy.roots();
+        let ctx = match roots.split_first() {
+            Some((primary, rest)) => ToolContext::with_roots(primary.clone(), rest.to_vec()),
+            None => ToolContext::new(policy.workspace()),
+        };
         Self {
             provider,
             tools,

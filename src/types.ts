@@ -58,6 +58,8 @@ export interface Snapshot {
   provider_reason: string | null;
   /** 空间清单读取时遇到的问题（读坏、版本过高）。不阻断使用。 */
   spaces_warning: string | null;
+  /** 一个空间最多能附加几个目录。界面据此禁用「添加」，不写死第二份常量。 */
+  max_extra_roots: number;
   /** 应用版本。 */
   version: string;
 }
@@ -132,6 +134,8 @@ export interface SpaceInfo {
   id: string;
   name: string;
   path: string;
+  /** 主目录之外、同一空间内也可读写的目录。旧清单里没有这一项，读出来是空数组。 */
+  extra_paths: string[];
   /** 该空间下的会话数（含已归档）。 */
   sessions: number;
   /** 目录还在不在。盘符没挂载时是 false。 */

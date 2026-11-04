@@ -1,6 +1,8 @@
 interface Props {
   title: string;
   workspace: string;
+  /** 附加目录数量。0 就不显示——没有的时候不该多一个「+0」。 */
+  extraRoots: number;
   spaceName: string;
   searchOpen: boolean;
   onToggleSearch: () => void;
@@ -10,6 +12,7 @@ interface Props {
 export default function ChatHead({
   title,
   workspace,
+  extraRoots,
   spaceName,
   searchOpen,
   onToggleSearch,
@@ -22,8 +25,16 @@ export default function ChatHead({
           <span className="crumb-sep">/</span>
           <span className="crumb-current">{title}</span>
         </div>
-        <p className="chat-meta" title={workspace}>
+        <p
+          className="chat-meta"
+          title={
+            extraRoots > 0
+              ? `${workspace}（另附加 ${extraRoots} 个目录）`
+              : workspace
+          }
+        >
           {workspace}
+          {extraRoots > 0 && <span className="chat-meta-extra">+{extraRoots}</span>}
         </p>
       </div>
 

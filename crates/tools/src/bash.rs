@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use goldenagent_core::{Error, Result, ToolKind, ToolSpec};
 use serde_json::{json, Value};
 
-use crate::jail::resolve;
 use crate::{Tool, ToolContext};
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -41,10 +40,7 @@ impl Tool for Bash {
 
     async fn run(&self, input: Value, ctx: &ToolContext) -> Result<String> {
         let command = crate::required_str(&input, "command")?;
-        let cwd = resolve(
-            &ctx.workspace,
-            input.get("cwd").and_then(Value::as_str).unwrap_or("."),
-        )?;
+        let cwd = ctx.resolve(input.get("cwd").and_then(Value::as_str).unwrap_or("."))?;
         if !cwd.is_dir() {
             return Err(Error::Tool(format!(
                 "工作目录 {} 不存在或不是目录",

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use goldenagent_core::{Error, Result, ToolKind, ToolSpec};
 use serde_json::{json, Value};
 
-use crate::jail::resolve;
+
 use crate::{required_str, Tool, ToolContext};
 
 /// 单次读取的字节上限。超了直接拒绝，不截断——
@@ -33,7 +33,7 @@ impl Tool for ReadFile {
 
     async fn run(&self, input: Value, ctx: &ToolContext) -> Result<String> {
         let raw = required_str(&input, "path")?;
-        let path = resolve(&ctx.workspace, raw)?;
+        let path = ctx.resolve(raw)?;
 
         let meta = tokio::fs::metadata(&path)
             .await

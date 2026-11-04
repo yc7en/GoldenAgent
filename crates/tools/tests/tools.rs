@@ -245,3 +245,100 @@ fn default_registry_exposes_all_tools() {
         "bash 必须是执行类，不能被当成写类按路径放行"
     );
 }
+
+// ---------------------------------------------------------------------------
+// B18 · 多根工作区
+//
+// 验收三条：附加根里能读写、相对路径不被附加根抢走、
+// 把附加根从根集合里拿掉之后同一条写入重新被拒（证明放行范围是清单在管，
+// 不是"加过一次就永久有效"）。
+// ---------------------------------------------------------------------------
+
+/// 主根之外再建一个目录，返回 (工作区, 附加根)。
+fn with_extra_root() -> (TempWorkspace, PathBuf) {
+    let ws = TempWorkspace::new();
+    let extra = ws.path.with_extension("extra");
+    std::fs::create_dir_all(&extra).unwrap();
+    (ws, extra)
+}
+
+#[tokio::test]
+async fn extra_root_is_writable_via_absolute_path() {
+    let (ws, extra) = with_extra_root();
+    let ctx = ToolContext::with_roots(&ws.path, vec![extra.clone()]);
+    let reg = registry();
+
+    let target = extra.join("note.md");
+    reg.run(
+        "write_file",
+        json!({ "path": target.to_string_lossy(), "content": "来自附加目录" }),
+        &ctx,
+    )
+    .await
+    .expect("附加根应可写");
+
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "来自附加目录",
+        "文件必须真的落在附加目录里"
+    );
+
+    let read = reg
+        .run("read_file", json!({ "path": target.to_string_lossy() }), &ctx)
+        .await
+        .expect("附加根应可读");
+    assert!(read.contains("来自附加目录"), "{read}");
+}
+
+/// 相对路径只挂主根：即便附加根里有同名文件，`note.md` 也只解析到主根。
+#[tokio::test]
+async fn relative_path_does_not_fall_into_the_extra_root() {
+    let (ws, extra) = with_extra_root();
+    std::fs::write(ws.path.join("note.md"), "主根版本").unwrap();
+    std::fs::write(extra.join("note.md"), "附加根版本").unwrap();
+
+    let ctx = ToolContext::with_roots(&ws.path, vec![extra]);
+    let got = registry()
+        .run("read_file", json!({ "path": "note.md" }), &ctx)
+        .await
+        .unwrap();
+
+    assert!(got.contains("主根版本"), "相对路径被附加根抢走了: {got}");
+}
+
+/// 拿掉附加根之后，同一条写入必须重新被拒。
+///
+/// 这条是破坏性验收：它证明"能写附加目录"来自**当前根集合**，
+/// 而不是某种一旦授予就留在别处的状态。
+#[tokio::test]
+async fn removing_the_extra_root_revokes_access() {
+    let (ws, extra) = with_extra_root();
+    let target = extra.join("note.md");
+    let body = json!({ "path": target.to_string_lossy(), "content": "x" });
+    let reg = registry();
+
+    let granted = ToolContext::with_roots(&ws.path, vec![extra.clone()]);
+    reg.run("write_file", body.clone(), &granted)
+        .await
+        .expect("有附加根时应可写");
+
+    let revoked = ToolContext::with_roots(&ws.path, Vec::new());
+    let err = reg
+        .run("write_file", body, &revoked)
+        .await
+        .expect_err("拿掉附加根后必须被拒");
+    assert!(err.to_string().contains("越界"), "{err}");
+}
+
+/// 主根里的相对路径仍然照旧，多根化没有把原来的边界弄松。
+#[tokio::test]
+async fn extra_roots_do_not_loosen_the_primary_jail() {
+    let (ws, extra) = with_extra_root();
+    let ctx = ToolContext::with_roots(&ws.path, vec![extra]);
+
+    let err = registry()
+        .run("read_file", json!({ "path": "../../../etc/passwd" }), &ctx)
+        .await
+        .expect_err("相对越界仍须拒绝");
+    assert!(err.to_string().contains("越界"), "{err}");
+}

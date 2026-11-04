@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use goldenagent_core::{Result, ToolKind, ToolSpec};
 use serde_json::{json, Value};
 
-use crate::jail::resolve;
 use crate::walk::walk_files;
 use crate::{Tool, ToolContext};
 
@@ -33,10 +32,7 @@ impl Tool for Glob {
 
     async fn run(&self, input: Value, ctx: &ToolContext) -> Result<String> {
         let pattern = crate::required_str(&input, "pattern")?;
-        let start = resolve(
-            &ctx.workspace,
-            input.get("path").and_then(Value::as_str).unwrap_or("."),
-        )?;
+        let start = ctx.resolve(input.get("path").and_then(Value::as_str).unwrap_or("."))?;
         let limit = input
             .get("limit")
             .and_then(Value::as_u64)

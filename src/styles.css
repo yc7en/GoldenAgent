@@ -1488,6 +1488,63 @@ mark {
   opacity: 0.85;
 }
 
+/* 附加目录：一组可增删的输入行。
+   用一块浅底把「这些是同一件事的延伸」在视觉上归拢起来，
+   否则用户会以为它们是两个独立字段。 */
+.dlg-extra {
+  margin: 2px 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-sunken);
+}
+
+.dlg-extra-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+}
+
+.dlg-extra-count {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.dlg-extra-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0;
+}
+
+.dlg-extra-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.dlg-extra-add {
+  margin-top: 2px;
+  font-size: 12px;
+}
+
+.dlg-extra-add:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.chat-meta-extra {
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
 .dlg-check {
   display: flex;
   align-items: flex-start;

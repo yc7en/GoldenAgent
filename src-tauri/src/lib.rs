@@ -63,6 +63,8 @@ struct Snapshot {
     provider_reason: Option<String>,
     /// 空间清单读取时遇到的问题（读坏、版本过高）。不阻断使用。
     spaces_warning: Option<String>,
+    /// 一个空间最多能附加几个目录。界面据此禁用「添加」按钮，不再写死一份常量。
+    max_extra_roots: usize,
     /// 应用版本，显示在设置面板里。
     version: String,
 }
@@ -103,6 +105,8 @@ struct SpaceDto {
     id: String,
     name: String,
     path: String,
+    /// 主目录之外、同一空间内也可读写的目录。
+    extra_paths: Vec<String>,
     sessions: usize,
     /// 目录还在不在。盘符没挂载时是 `false`，界面要标灰。
     available: bool,
@@ -115,6 +119,11 @@ impl From<SpaceInfo> for SpaceDto {
             id: space.id,
             name: space.name,
             path: space.path.display().to_string(),
+            extra_paths: space
+                .extra_paths
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect(),
             sessions: space.sessions,
             available: space.available,
             created_at_ms: space.created_at_ms,
@@ -250,6 +259,7 @@ async fn snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
         provider_reason: provider_state.reason().map(str::to_string),
         provider_state: provider_state.as_str().to_string(),
         spaces_warning: service.spaces_warning(),
+        max_extra_roots: goldenagent_app::MAX_EXTRA_ROOTS,
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }
@@ -360,27 +370,44 @@ async fn create_space(
     state: State<'_, AppState>,
     name: String,
     path: String,
+    extra_paths: Option<Vec<String>>,
 ) -> Result<SpaceDto, String> {
     let service = Arc::clone(state.inner().service());
+    let extra: Vec<std::path::PathBuf> = extra_paths
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|dir| !dir.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .collect();
     service
-        .create_space(&name, std::path::Path::new(&path))
+        .create_space(&name, std::path::Path::new(&path), &extra)
         .await
         .map(SpaceDto::from)
         .map_err(|e| e.to_string())
 }
 
-/// 改名 / 换目录。两项都可缺省，只传要改的那个。
+/// 改名 / 换目录 / 换附加目录。各项都可缺省，只传要改的那个。
+///
+/// `extra_paths` 的 `Some(空数组)` 表示**清空**——这与"不传"必须能区分，
+/// 否则界面上删光附加目录这件事就没有表达方式。
 #[tauri::command]
 async fn update_space(
     state: State<'_, AppState>,
     id: String,
     name: Option<String>,
     path: Option<String>,
+    extra_paths: Option<Vec<String>>,
 ) -> Result<SpaceDto, String> {
     let service = Arc::clone(state.inner().service());
     let path = path.as_deref().map(std::path::Path::new);
+    let extra: Option<Vec<std::path::PathBuf>> = extra_paths.map(|list| {
+        list.into_iter()
+            .filter(|dir| !dir.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .collect()
+    });
     service
-        .update_space(&id, name.as_deref(), path)
+        .update_space(&id, name.as_deref(), path, extra.as_deref())
         .await
         .map(SpaceDto::from)
         .map_err(|e| e.to_string())

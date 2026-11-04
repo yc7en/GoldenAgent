@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use goldenagent_core::{ToolKind, ToolSpec};
-use goldenagent_tools::jail::resolve;
+use goldenagent_tools::jail::resolve_in;
 use serde_json::Value;
 
 /// 四档权限模式。默认 [`Mode::Ask`]：读写文件都要用户点头。
@@ -73,6 +73,8 @@ impl Decision {
 pub struct Policy {
     mode: Mode,
     workspace: PathBuf,
+    /// 空间附加的目录。空的时候一切与单根时代相同。
+    extra_roots: Vec<PathBuf>,
 }
 
 impl Policy {
@@ -80,6 +82,26 @@ impl Policy {
         Self {
             mode,
             workspace: workspace.into(),
+            extra_roots: Vec::new(),
+        }
+    }
+
+    /// `roots[0]` 是主根，其余是附加根。
+    ///
+    /// 附加根在 `WorkspaceWrite` 档下与主根同等待遇——这是 B18 的决定 2：
+    /// 「附加进来但不能写」在权限上等于没附加，用户每写一次点一次授权，
+    /// 两次之后就再也不用了。
+    pub fn with_roots(mode: Mode, roots: Vec<PathBuf>) -> Self {
+        let mut roots = roots;
+        let workspace = if roots.is_empty() {
+            PathBuf::new()
+        } else {
+            roots.remove(0)
+        };
+        Self {
+            mode,
+            workspace,
+            extra_roots: roots,
         }
     }
 
@@ -89,6 +111,17 @@ impl Policy {
 
     pub fn workspace(&self) -> &Path {
         &self.workspace
+    }
+
+    /// 主根 + 附加根。空工作区不占位——否则它会被当成"空前缀"，
+    /// 而任何路径都以空前缀开头，等于处处放行。
+    pub fn roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::with_capacity(1 + self.extra_roots.len());
+        if !self.workspace.as_os_str().is_empty() {
+            roots.push(self.workspace.clone());
+        }
+        roots.extend(self.extra_roots.iter().cloned());
+        roots
     }
 
     /// 移动端/前端切档用。返回是否有变化。
@@ -146,7 +179,7 @@ impl Policy {
             };
         };
 
-        let inside = resolve(&self.workspace, raw_path).is_ok();
+        let inside = resolve_in(&self.roots(), raw_path).is_ok();
 
         match (self.mode, inside) {
             (Mode::ReadOnly, _) => Decision::Deny {
@@ -156,11 +189,11 @@ impl Policy {
                 summary: format!("{} 想写入 {raw_path}", spec.name),
             },
             (Mode::Ask, false) => Decision::Deny {
-                reason: format!("{raw_path} 在工作区外，Ask 模式不允许写入工作区外文件"),
+                reason: format!("{raw_path} 不在允许的目录里，Ask 模式不允许写工作区之外"),
             },
             (Mode::WorkspaceWrite, true) => Decision::Allow,
             (Mode::WorkspaceWrite, false) => Decision::Deny {
-                reason: format!("{raw_path} 在工作区外，工作区可写模式只允许写工作区内"),
+                reason: format!("{raw_path} 不在允许的目录里，工作区可写模式只覆盖空间内（主目录 + 附加目录）"),
             },
             (Mode::Bypass, _) => Decision::Allow,
         }
@@ -211,6 +244,55 @@ mod tests {
 
     fn decide(mode: Mode, kind: ToolKind, input: Value) -> Decision {
         policy(mode).decide(&spec("whatever", kind), &input)
+    }
+
+    /// 主根 + 一个附加根。用 temp_dir 拼，避免 `/data/...` 在 Windows 上
+    /// 被判成相对路径（那边没有盘符就不算绝对路径）。
+    fn roots_pair() -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir();
+        (base.join("ga-b18-primary"), base.join("ga-b18-extra"))
+    }
+
+    /// 附加根在 `WorkspaceWrite` 档下必须与主根同等待遇。
+    ///
+    /// 这是 B18 的决定 2。反过来说：如果哪天有人为了"更安全"把附加根
+    /// 从 `WorkspaceWrite` 的放行范围里摘出去，这条会红——那等于让这个功能
+    /// 只在 `Bypass` 档可用，而 `Bypass` 本来就不需要它。
+    #[test]
+    fn workspace_write_covers_extra_roots() {
+        let (primary, extra) = roots_pair();
+        let inside_extra = json!({ "path": extra.join("spec.md").to_string_lossy() });
+        let spec_ = spec("write_file", ToolKind::Write);
+
+        let ws = Policy::with_roots(Mode::WorkspaceWrite, vec![primary.clone(), extra.clone()]);
+        assert_eq!(ws.decide(&spec_, &inside_extra), Decision::Allow);
+
+        let ask = Policy::with_roots(Mode::Ask, vec![primary.clone(), extra.clone()]);
+        assert!(matches!(ask.decide(&spec_, &inside_extra), Decision::Ask { .. }));
+
+        let ro = Policy::with_roots(Mode::ReadOnly, vec![primary, extra]);
+        assert!(ro.decide(&spec_, &inside_extra).is_deny());
+    }
+
+    /// 加了附加根，不等于把工作区外也放开了。
+    #[test]
+    fn extra_roots_do_not_widen_the_boundary_beyond_the_list() {
+        let (primary, extra) = roots_pair();
+        let outside = json!({ "path": extra.join("..").join("other").join("x.md").to_string_lossy() });
+
+        let p = Policy::with_roots(Mode::WorkspaceWrite, vec![primary, extra]);
+        assert!(p
+            .decide(&spec("write_file", ToolKind::Write), &outside)
+            .is_deny());
+    }
+
+    /// 空根集合不能变成"处处放行"。
+    #[test]
+    fn empty_roots_deny_rather_than_allow() {
+        let p = Policy::with_roots(Mode::WorkspaceWrite, Vec::new());
+        assert!(p
+            .decide(&spec("write_file", ToolKind::Write), &json!({"path": "a.txt"}))
+            .is_deny());
     }
 
     /// 四档 × 读/写 × 内/外 的完整矩阵。

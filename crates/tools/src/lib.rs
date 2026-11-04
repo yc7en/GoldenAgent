@@ -32,14 +32,40 @@ pub use write_file::MAX_WRITE_BYTES;
 
 #[derive(Debug, Clone)]
 pub struct ToolContext {
+    /// 主目录。`bash` 的默认 cwd、相对路径的落点、`grep`/`glob` 的默认遍历起点。
     pub workspace: PathBuf,
+    /// 空间附加的目录：可以读写，但**不**参与相对路径解析。
+    pub extra_roots: Vec<PathBuf>,
 }
 
 impl ToolContext {
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         Self {
             workspace: workspace.into(),
+            extra_roots: Vec::new(),
         }
+    }
+
+    /// 多根构造：`primary` 在前，附加目录在后。顺序就是优先级。
+    pub fn with_roots(primary: impl Into<PathBuf>, extra: Vec<PathBuf>) -> Self {
+        Self {
+            workspace: primary.into(),
+            extra_roots: extra,
+        }
+    }
+
+    /// 主根 + 附加根，供 jail 判定。
+    pub fn roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::with_capacity(1 + self.extra_roots.len());
+        roots.push(self.workspace.clone());
+        roots.extend(self.extra_roots.iter().cloned());
+        roots
+    }
+
+    /// 工具里解析路径的唯一入口。别自己拼 `workspace.join(...)`——
+    /// 那样附加目录永远不会生效，而且会绕过越界检查。
+    pub fn resolve(&self, raw: &str) -> Result<PathBuf> {
+        jail::resolve_in(&self.roots(), raw)
     }
 }
 

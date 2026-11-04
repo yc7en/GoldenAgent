@@ -540,6 +540,10 @@ export default function App() {
           <ChatHead
             title={activeSession?.title ?? "新对话"}
             workspace={snapshot?.workspace ?? ""}
+            extraRoots={
+              spaces.find((space) => space.id === snapshot?.active_space_id)?.extra_paths
+                .length ?? 0
+            }
             spaceName={activeSpaceName}
             searchOpen={sessionSearchOpen}
             onToggleSearch={() => {
@@ -625,16 +629,24 @@ export default function App() {
         <SpaceDialog
           mode={spaceDialog.mode}
           space={spaceDialog.mode === "edit" ? spaceDialog.space : undefined}
+          maxExtra={snapshot?.max_extra_roots ?? 8}
           busy={busy}
           onClose={() => setSpaceDialog(null)}
-          onSubmit={async (name, path) => {
+          onSubmit={async (name, path, extraPaths) => {
             if (spaceDialog.mode === "create") {
-              await api.createSpace(name, path);
+              await api.createSpace(name, path, extraPaths);
             } else {
+              const before = spaceDialog.space;
+              // 附加目录是「整份替换」的语义：内容一样就不提交，
+              // 否则每改一次名字都把列表重写一遍（顺序也会被规范化）。
+              const sameExtra =
+                before.extra_paths.length === extraPaths.length &&
+                before.extra_paths.every((item, index) => item === extraPaths[index]);
               await api.updateSpace(
-                spaceDialog.space.id,
-                name === spaceDialog.space.name ? null : name,
-                path === spaceDialog.space.path ? null : path,
+                before.id,
+                name === before.name ? null : name,
+                path === before.path ? null : path,
+                sameExtra ? null : extraPaths,
               );
             }
             setSpaceDialog(null);

@@ -35,6 +35,12 @@ pub const DEFAULT_SPACE_DIR: &str = "_default";
 const MANIFEST_VERSION: u32 = 1;
 const NAME_MAX_CHARS: usize = 48;
 
+/// 附加目录的上限（不含主目录）。
+///
+/// 不是省资源，是不想让设置界面变成一列输入框。真要更多，那说明
+/// 用法已经变形了——该做的是分空间，不是往一个空间里塞。
+pub const MAX_EXTRA_ROOTS: usize = 8;
+
 /// 一个空间。`id` 进路径，`name` 只给人看。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Space {
@@ -42,6 +48,22 @@ pub struct Space {
     pub name: String,
     pub path: PathBuf,
     pub created_at_ms: u64,
+    /// 主目录之外、同样允许工具读写的目录。
+    ///
+    /// `#[serde(default)]` 是本字段的全部兼容成本：B17 写下的 `spaces.json`
+    /// 里没有它，读进来是空列表，行为与加这个字段之前一模一样。
+    #[serde(default)]
+    pub extra_paths: Vec<PathBuf>,
+}
+
+impl Space {
+    /// 主根在前，附加根在后。顺序有意义：相对路径只挂第一个。
+    pub fn roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::with_capacity(1 + self.extra_paths.len());
+        roots.push(self.path.clone());
+        roots.extend(self.extra_paths.iter().cloned());
+        roots
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -170,9 +192,15 @@ impl SpaceStore {
     ///
     /// 目录不存在就创建（含父级）。这是决策 1：让用户先去资源管理器建文件夹，
     /// 是把一个「新建」操作拆成两个应用程序才能完成的动作。
-    pub async fn create(&self, name: &str, path: impl AsRef<Path>) -> Result<Space> {
+    pub async fn create(
+        &self,
+        name: &str,
+        path: impl AsRef<Path>,
+        extra: &[PathBuf],
+    ) -> Result<Space> {
         let name = clean_name(name)?;
         let path = normalize_path(path.as_ref())?;
+        let extra_paths = clean_extra_paths(&path, extra).await?;
         let (mut spaces, _) = self.load().await;
 
         if spaces
@@ -195,6 +223,7 @@ impl SpaceStore {
             name,
             path,
             created_at_ms: now_ms(),
+            extra_paths,
         };
 
         // 先建会话目录再写清单：中间态是「清单里还没有、目录空的」，
@@ -208,14 +237,17 @@ impl SpaceStore {
         Ok(space)
     }
 
-    /// 改名 / 换目录。只传要改的那一项，另一项传 `None`。
+    /// 改名 / 换目录 / 换附加目录。只传要改的那一项，其余传 `None`。
     ///
     /// 换目录不动历史：会话还在原空间目录里，改的只是「在哪儿干活」。
+    /// `extra` 传 `Some(&[])` 表示清空附加目录——`None` 与「空列表」必须能区分，
+    /// 否则界面上删光附加目录这件事就没有表达方式。
     pub async fn update(
         &self,
         id: &str,
         name: Option<&str>,
         path: Option<&Path>,
+        extra: Option<&[PathBuf]>,
     ) -> Result<Space> {
         let (mut spaces, _) = self.load().await;
         let index = spaces
@@ -249,6 +281,11 @@ impl SpaceStore {
             }
             ensure_dir(&normalized).await?;
             spaces[index].path = normalized;
+        }
+
+        if let Some(extra) = extra {
+            let primary = spaces[index].path.clone();
+            spaces[index].extra_paths = clean_extra_paths(&primary, extra).await?;
         }
 
         let updated = spaces[index].clone();
@@ -358,8 +395,37 @@ fn normalize_path(path: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
-async fn ensure_dir(path: &Path) -> Result<()> {
-    tokio::fs::create_dir_all(path).await.map_err(|e| {
+/// 校验附加目录：绝对路径、去重、不能等于主目录、不超过上限，并顺手建出来。
+///
+/// 去重是必须的：同一个目录挂两次会让 jail 的"落在任一根内"判定跑两遍，
+/// 更要紧的是界面上会出现两个一样的行，用户以为删掉一个就少一处授权。
+async fn clean_extra_paths(primary: &Path, extra: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut cleaned: Vec<PathBuf> = Vec::with_capacity(extra.len());
+
+    for raw in extra {
+        let path = normalize_path(raw)?;
+        if same_path(primary, &path) {
+            // 主目录已经在里面了，再挂一次是重复。
+            continue;
+        }
+        if cleaned.iter().any(|kept| same_path(kept, &path)) {
+            continue;
+        }
+        if cleaned.len() >= MAX_EXTRA_ROOTS {
+            return Err(Error::Session(format!(
+                "附加目录最多 {MAX_EXTRA_ROOTS} 个"
+            )));
+        }
+        cleaned.push(path);
+    }
+
+    for path in &cleaned {
+        ensure_dir(path).await?;
+    }
+    Ok(cleaned)
+}
+
+async fn ensure_dir(path: &Path) -> Result<()> {    tokio::fs::create_dir_all(path).await.map_err(|e| {
         Error::Session(format!("创建目录 {} 失败: {e}", path.display()))
     })?;
     let is_dir = tokio::fs::metadata(path)
@@ -423,12 +489,12 @@ mod tests {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    struct TempDir {
-        path: PathBuf,
+    pub(super) struct TempDir {
+        pub(super) path: PathBuf,
     }
 
     impl TempDir {
-        fn new(tag: &str) -> Self {
+        pub(super) fn new(tag: &str) -> Self {
             let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
                 "goldenagent-space-{tag}-{}-{seq}",
@@ -438,11 +504,11 @@ mod tests {
             Self { path }
         }
 
-        fn store(&self) -> SpaceStore {
+        pub(super) fn store(&self) -> SpaceStore {
             SpaceStore::new(self.path.join(".goldenagent"))
         }
 
-        fn project(&self, name: &str) -> PathBuf {
+        pub(super) fn project(&self, name: &str) -> PathBuf {
             self.path.join(name)
         }
     }
@@ -463,7 +529,7 @@ mod tests {
         assert!(store.default_dir().is_dir());
 
         // 第二次不报错、不重置已写的清单
-        let space = store.create("项目", dir.project("repo")).await.unwrap();
+        let space = store.create("项目", dir.project("repo"), &[]).await.unwrap();
         store.bootstrap().await.unwrap();
         let listed = store.list().await.unwrap();
         assert_eq!(listed.len(), 1);
@@ -477,20 +543,20 @@ mod tests {
         store.bootstrap().await.unwrap();
 
         let nested = dir.project("a/b/c");
-        let space = store.create("A", &nested).await.unwrap();
+        let space = store.create("A", &nested, &[]).await.unwrap();
         assert!(nested.is_dir(), "目录不存在时要顺手建出来");
         assert!(space.id.starts_with("sp-"));
         assert!(store.space_dir(&space.id).is_dir());
 
-        let dup_name = store.create("a", dir.project("other")).await;
+        let dup_name = store.create("a", dir.project("other"), &[]).await;
         assert!(dup_name.is_err(), "空间名查重忽略大小写");
 
-        let dup_path = store.create("B", &nested).await;
+        let dup_path = store.create("B", &nested, &[]).await;
         assert!(dup_path.is_err(), "同一目录不能建两个空间");
 
         // 相对路径直接拒
-        assert!(store.create("C", Path::new("relative/dir")).await.is_err());
-        assert!(store.create("   ", dir.project("blank")).await.is_err());
+        assert!(store.create("C", Path::new("relative/dir"), &[]).await.is_err());
+        assert!(store.create("   ", dir.project("blank"), &[]).await.is_err());
     }
 
     #[tokio::test]
@@ -499,7 +565,7 @@ mod tests {
         let store = dir.store();
         store.bootstrap().await.unwrap();
 
-        let space = store.create("旧名", dir.project("old")).await.unwrap();
+        let space = store.create("旧名", dir.project("old"), &[]).await.unwrap();
         store
             .catalog()
             .store(Some(&space.id))
@@ -507,12 +573,12 @@ mod tests {
             .await
             .unwrap();
 
-        let renamed = store.update(&space.id, Some("新名"), None).await.unwrap();
+        let renamed = store.update(&space.id, Some("新名"), None, None).await.unwrap();
         assert_eq!(renamed.name, "新名");
         assert_eq!(renamed.path, space.path, "改名不该动路径");
 
         let moved = store
-            .update(&space.id, None, Some(&dir.project("new")))
+            .update(&space.id, None, Some(&dir.project("new")), None)
             .await
             .unwrap();
         assert_eq!(moved.path, dir.project("new"));
@@ -530,7 +596,7 @@ mod tests {
         let store = dir.store();
         store.bootstrap().await.unwrap();
 
-        let space = store.create("要删的", dir.project("gone")).await.unwrap();
+        let space = store.create("要删的", dir.project("gone"), &[]).await.unwrap();
         store
             .catalog()
             .store(Some(&space.id))
@@ -569,4 +635,128 @@ mod tests {
             "要留下一份备份"
         );
     }
+}
+
+#[cfg(test)]
+mod extra_root_tests {
+    use super::tests::TempDir;
+    use super::*;
+
+
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn extra_paths_are_created_persisted_and_deduped() {
+    let dir = TempDir::new("extra");
+    let store = dir.store();
+    let primary = dir.project("repo");
+    let assets = dir.project("assets");
+    let deep = dir.project("deep").join("nested"); // 父级还不存在
+
+    let space = store
+        .create(
+            "项目",
+            &primary,
+            &[
+                assets.clone(),
+                deep.clone(),
+                assets.clone(),  // 重复：只该留一份
+                primary.clone(), // 等于主目录：不该入表
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        space.extra_paths,
+        vec![assets.clone(), deep.clone()],
+        "附加目录要去重、且排除主目录"
+    );
+    assert!(assets.is_dir(), "附加目录不存在时应自动创建");
+    assert!(deep.is_dir(), "父级不存在也要建出来");
+
+    // 落盘了没有——换一个 store 重新读。
+    let reopened = dir.store().list().await.unwrap();
+    assert_eq!(reopened[0].extra_paths.len(), 2);
+    assert_eq!(reopened[0].roots().len(), 3, "主根 + 两个附加根");
+    assert_eq!(reopened[0].roots()[0], primary, "主根必须排第一");
+}
+
+#[tokio::test]
+async fn extra_paths_reject_relative_and_cap_the_count() {
+    let dir = TempDir::new("extra-rules");
+    let store = dir.store();
+
+    let relative = store
+        .create("甲", dir.project("a"), &[PathBuf::from("relative/dir")])
+        .await;
+    assert!(relative.is_err(), "相对路径不该被接受");
+
+    let mut too_many: Vec<PathBuf> = (0..=MAX_EXTRA_ROOTS)
+        .map(|i| dir.project(&format!("extra-{i}")))
+        .collect();
+    let err = store
+        .create("乙", dir.project("b"), &too_many)
+        .await
+        .expect_err("超过上限应报错");
+    assert!(err.to_string().contains("最多"), "{err}");
+
+    // 恰好等于上限是可以的。
+    too_many.truncate(MAX_EXTRA_ROOTS);
+    assert!(store
+        .create("丙", dir.project("c"), &too_many)
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
+async fn update_replaces_and_clears_extra_paths() {
+    let dir = TempDir::new("extra-update");
+    let store = dir.store();
+    let first = dir.project("first");
+    let second = dir.project("second");
+
+    let space = store
+        .create("项目", dir.project("repo"), &[first.clone()])
+        .await
+        .unwrap();
+
+    // None = 不动
+    let untouched = store.update(&space.id, Some("改名"), None, None).await.unwrap();
+    assert_eq!(untouched.extra_paths, vec![first.clone()]);
+
+    // Some = 整份替换
+    let replaced = store
+        .update(&space.id, None, None, Some(&[second.clone()]))
+        .await
+        .unwrap();
+    assert_eq!(replaced.extra_paths, vec![second]);
+
+    // Some(&[]) = 清空。必须能和 None 区分开。
+    let cleared = store.update(&space.id, None, None, Some(&[])).await.unwrap();
+    assert!(cleared.extra_paths.is_empty(), "应能清空");
+    assert_eq!(cleared.roots().len(), 1);
+}
+
+/// B17 写下的清单里没有 `extra_paths` 这个字段。
+/// 读它必须得到空列表，而不是解析失败。
+#[tokio::test]
+async fn manifest_without_extra_paths_still_loads() {
+    let dir = TempDir::new("legacy-manifest");
+    let store = dir.store();
+    std::fs::create_dir_all(dir.path.join(".goldenagent")).unwrap();
+    std::fs::write(
+        store.manifest_path(),
+        r#"{"version":1,"spaces":[
+            {"id":"sp-1-aaaa","name":"老空间","path":"P://old","created_at_ms":1}
+        ]}"#,
+    )
+    .unwrap();
+
+    let (spaces, warning) = store.load().await;
+    assert!(warning.is_none(), "旧清单不该被当成坏文件: {warning:?}");
+    assert_eq!(spaces.len(), 1);
+    assert!(spaces[0].extra_paths.is_empty());
+    assert_eq!(spaces[0].roots().len(), 1);
+}
 }

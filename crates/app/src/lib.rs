@@ -36,7 +36,9 @@ pub use workspace::{resolve as resolve_workspace, WorkspaceOrigin};
 pub use goldenagent_core::{Event, Message};
 pub use goldenagent_loop::{EventSink, Outcome};
 pub use goldenagent_policy::Mode;
-pub use goldenagent_session::{SessionHits, SessionSummary as SessionEntry, DEFAULT_SPACE_DIR};
+pub use goldenagent_session::{
+    SessionHits, SessionSummary as SessionEntry, DEFAULT_SPACE_DIR, MAX_EXTRA_ROOTS,
+};
 
 /// 一次会话的装配参数。
 #[derive(Debug, Clone)]
@@ -135,13 +137,28 @@ struct ProviderRuntime {
 
 /// 当前在哪个空间干活。
 ///
-/// `path` 是工具 jail 的根。它随空间切换，但**一轮对话内绝不变化**（A-12）：
-/// `chat()` 开头把它快照成局部变量，整轮不再看锁。
+/// `roots` 是工具 jail 允许的全部根：第一个是主目录，其余是空间附加的目录。
+/// 它随空间切换，但**一轮对话内绝不变化**（A-12）：`chat()` 开头把整份根集合
+/// 快照成局部变量，整轮不再看锁。
 #[derive(Debug, Clone)]
 struct ActiveWorkspace {
     /// `None` = 「任务」（默认空间）。
     space_id: Option<String>,
-    path: PathBuf,
+    roots: Vec<PathBuf>,
+}
+
+impl ActiveWorkspace {
+    fn new(space_id: Option<String>, primary: PathBuf, extra: Vec<PathBuf>) -> Self {
+        let mut roots = Vec::with_capacity(1 + extra.len());
+        roots.push(primary);
+        roots.extend(extra);
+        Self { space_id, roots }
+    }
+
+    /// 主目录。`bash` 的 cwd、相对路径的落点都是它。
+    fn primary(&self) -> PathBuf {
+        self.roots.first().cloned().unwrap_or_default()
+    }
 }
 
 /// 一个空间在界面上的样子。
@@ -150,6 +167,8 @@ pub struct SpaceInfo {
     pub id: String,
     pub name: String,
     pub path: PathBuf,
+    /// 主目录之外、同一空间内也可读写的目录。
+    pub extra_paths: Vec<PathBuf>,
     pub created_at_ms: u64,
     /// 该空间下的会话数（含已归档）。
     pub sessions: usize,
@@ -207,10 +226,7 @@ impl AgentService {
             Some(sessions) => SpaceStore::with_sessions_root(dir, sessions.clone()),
             None => SpaceStore::new(dir),
         });
-        let active = ActiveWorkspace {
-            space_id: None,
-            path: config.workspace.clone(),
-        };
+        let active = ActiveWorkspace::new(None, config.workspace.clone(), Vec::new());
         let runtime = ProviderRuntime {
             provider,
             config: ProviderConfig::mock(),
@@ -406,11 +422,22 @@ impl AgentService {
         Self::new(config, Arc::new(MockProvider::default()))
     }
 
-    /// 当前**活动**工作区。没有空间时就是启动时解析出的默认工作区。
+    /// 当前**活动**工作区的主目录。没有空间时就是启动时解析出的默认工作区。
     pub fn workspace(&self) -> PathBuf {
         match self.active.read() {
-            Ok(active) => active.path.clone(),
-            Err(poisoned) => poisoned.into_inner().path.clone(),
+            Ok(active) => active.primary(),
+            Err(poisoned) => poisoned.into_inner().primary(),
+        }
+    }
+
+    /// 当前活动工作区的全部根（主目录在前，附加目录在后）。
+    ///
+    /// 这是 A-12 快照的单位：`chat()` 取一次，整轮用它，而不是每次工具调用
+    /// 都重新读锁——那样中途切空间会让同一轮的前后两步落在不同目录里。
+    pub fn roots(&self) -> Vec<PathBuf> {
+        match self.active.read() {
+            Ok(active) => active.roots.clone(),
+            Err(poisoned) => poisoned.into_inner().roots.clone(),
         }
     }
 
@@ -524,6 +551,7 @@ impl AgentService {
                 id: space.id,
                 name: space.name,
                 path: space.path,
+                extra_paths: space.extra_paths,
                 created_at_ms: space.created_at_ms,
             });
         }
@@ -531,44 +559,68 @@ impl AgentService {
     }
 
     /// 新建空间。名字查重在存储层，这里只做「不能指向应用状态目录」这道安全闸。
-    pub async fn create_space(&self, name: &str, path: &Path) -> Result<SpaceInfo> {
+    ///
+    /// 安全闸对附加目录同样生效：主目录指着项目目录、附加目录指着
+    /// `.goldenagent/sessions` 一样是 Agent 能改自己的会话记录。
+    pub async fn create_space(
+        &self,
+        name: &str,
+        path: &Path,
+        extra: &[PathBuf],
+    ) -> Result<SpaceInfo> {
         self.guard_space_path(path)?;
+        for dir in extra {
+            self.guard_space_path(dir)?;
+        }
         let store = self.space_store()?;
-        let space = store.create(name, path).await?;
+        let space = store.create(name, path, extra).await?;
         Ok(SpaceInfo {
             available: true,
             sessions: 0,
             id: space.id,
             name: space.name,
             path: space.path,
+            extra_paths: space.extra_paths,
             created_at_ms: space.created_at_ms,
         })
     }
 
-    /// 改名 / 换目录。活动空间换目录时必须空闲——否则这一轮会在旧目录里跑完，
-    /// 而下一轮突然换到新目录，同一个任务的读写跨越两个地方。
+    /// 改名 / 换目录 / 换附加目录。活动空间换了任一目录时必须空闲——否则这一轮
+    /// 会在旧目录里跑完，而下一轮突然换到新目录，同一个任务的读写跨越两个地方。
     pub async fn update_space(
         &self,
         id: &str,
         name: Option<&str>,
         path: Option<&Path>,
+        extra: Option<&[PathBuf]>,
     ) -> Result<SpaceInfo> {
-        if let Some(path) = path {
-            self.guard_space_path(path)?;
+        if path.is_some() || extra.is_some() {
+            if let Some(path) = path {
+                self.guard_space_path(path)?;
+            }
+            if let Some(extra) = extra {
+                for dir in extra {
+                    self.guard_space_path(dir)?;
+                }
+            }
             if self.active_space().as_deref() == Some(id) && self.is_busy() {
                 return Err(Error::Session(
-                    "这一轮还在跑，先停下再换空间目录".into(),
+                    "这一轮还在跑，先停下再改空间目录".into(),
                 ));
             }
         }
 
         let store = self.space_store()?;
-        let space = store.update(id, name, path).await?;
+        let space = store.update(id, name, path, extra).await?;
 
         // 活动空间的目录变了，活动工作区跟着变；否则界面切换了、工具还在老地方。
         if self.active_space().as_deref() == Some(id) {
             if let Ok(mut active) = self.active.write() {
-                active.path = space.path.clone();
+                *active = ActiveWorkspace::new(
+                    Some(space.id.clone()),
+                    space.path.clone(),
+                    space.extra_paths.clone(),
+                );
             }
         }
 
@@ -584,6 +636,7 @@ impl AgentService {
             id: space.id,
             name: space.name,
             path: space.path,
+            extra_paths: space.extra_paths,
             created_at_ms: space.created_at_ms,
         })
     }
@@ -599,8 +652,7 @@ impl AgentService {
         // 正在这个空间里：切回「任务」，并把当前会话重新定位（它已经被搬过去了）。
         if self.active_space().as_deref() == Some(id) {
             if let Ok(mut active) = self.active.write() {
-                active.space_id = None;
-                active.path = self.config.workspace.clone();
+                *active = ActiveWorkspace::new(None, self.config.workspace.clone(), Vec::new());
             }
             if let Some(current) = self.current_session() {
                 // 会话已经被搬到「任务」目录；重新打开一次，让 session_id 与归属对齐。
@@ -617,10 +669,12 @@ impl AgentService {
         if self.is_busy() {
             return Err(Error::Session("这一轮还在跑，先停下再切空间".into()));
         }
-        let path = self.workspace_for(id).await?;
+        let roots = self.roots_for(id).await?;
         if let Ok(mut active) = self.active.write() {
-            active.space_id = id.map(str::to_string);
-            active.path = path;
+            *active = ActiveWorkspace {
+                space_id: id.map(str::to_string),
+                roots,
+            };
         }
         Ok(())
     }
@@ -635,7 +689,12 @@ impl AgentService {
             .locate(id)
             .await?
             .ok_or_else(|| Error::Session(format!("会话 {id} 不存在")))?;
-        self.workspace_for(located.space_id.as_deref()).await
+        Ok(self
+            .roots_for(located.space_id.as_deref())
+            .await?
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| self.config.workspace.clone()))
     }
 
     pub async fn reveal_space(&self, id: &str) -> Result<PathBuf> {
@@ -661,12 +720,19 @@ impl AgentService {
         if let Ok(mut active) = self.active.write() {
             // 空间不存在时不要留一个指向不存在目录的活动工作区：
             // 回落到默认工作区，比让第一次工具调用报「路径不存在」好排查。
-            active.space_id = space_id.map(str::to_string);
-            active.path = match space_id {
-                None => self.config.workspace.clone(),
-                Some(_) => self
-                    .workspace_for_blocking(space_id)
-                    .unwrap_or_else(|| self.config.workspace.clone()),
+            *active = match space_id {
+                None => ActiveWorkspace::new(None, self.config.workspace.clone(), Vec::new()),
+                Some(id) => match self.roots_for_blocking(Some(id)) {
+                    Some(roots) => ActiveWorkspace {
+                        space_id: Some(id.to_string()),
+                        roots,
+                    },
+                    None => ActiveWorkspace::new(
+                        Some(id.to_string()),
+                        self.config.workspace.clone(),
+                        Vec::new(),
+                    ),
+                },
             };
         }
 
@@ -753,14 +819,16 @@ impl AgentService {
 
         // 空间可能已经在清单里被删、但会话文件还没搬（异常中断）。
         // 这时按默认工作区打开，至少历史还能看，不会「点得开却报错」。
-        let path = self
-            .workspace_for(located.space_id.as_deref())
+        let roots = self
+            .roots_for(located.space_id.as_deref())
             .await
-            .unwrap_or_else(|_| self.config.workspace.clone());
+            .unwrap_or_else(|_| vec![self.config.workspace.clone()]);
 
         if let Ok(mut active) = self.active.write() {
-            active.space_id = located.space_id.clone();
-            active.path = path;
+            *active = ActiveWorkspace {
+                space_id: located.space_id.clone(),
+                roots,
+            };
         }
 
         // 锁序：active 已在上面写过又放开，这里是 session → session_id。
@@ -871,35 +939,44 @@ impl AgentService {
         Ok(catalog.store(located.space_id.as_deref()))
     }
 
-    /// 空间 id → 工作目录。`None` 就是默认工作区。
-    async fn workspace_for(&self, space_id: Option<&str>) -> Result<PathBuf> {
+    /// 空间 id → 全部根目录（主目录在前）。`None` 就是默认工作区。
+    async fn roots_for(&self, space_id: Option<&str>) -> Result<Vec<PathBuf>> {
         match space_id {
-            None => Ok(self.config.workspace.clone()),
+            None => Ok(vec![self.config.workspace.clone()]),
             Some(id) => {
                 let space = self
                     .space_store()?
                     .get(id)
                     .await?
                     .ok_or_else(|| Error::Session(format!("空间 {id} 不存在")))?;
-                Ok(space.path)
+                Ok(space.roots())
             }
         }
     }
 
     /// `new_session_in` 是 async 上下文里的同步函数，不能 await，只能同步读清单。
-    fn workspace_for_blocking(&self, space_id: Option<&str>) -> Option<PathBuf> {
+    fn roots_for_blocking(&self, space_id: Option<&str>) -> Option<Vec<PathBuf>> {
         let id = space_id?;
         let store = self.space_store.as_ref()?;
         let file = std::fs::read_to_string(store.manifest_path()).ok()?;
         let value: serde_json::Value = serde_json::from_str(&file).ok()?;
-        value
+        let entry = value
             .get("spaces")?
             .as_array()?
             .iter()
-            .find(|space| space.get("id").and_then(|v| v.as_str()) == Some(id))
-            .and_then(|space| space.get("path"))
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from)
+            .find(|space| space.get("id").and_then(|v| v.as_str()) == Some(id))?;
+
+        let primary = PathBuf::from(entry.get("path")?.as_str()?);
+        let mut roots = vec![primary];
+        // 旧清单没有 extra_paths，读不到就是单根——与 B17 行为一致。
+        if let Some(list) = entry.get("extra_paths").and_then(|v| v.as_array()) {
+            roots.extend(
+                list.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(PathBuf::from),
+            );
+        }
+        Some(roots)
     }
 
     /// 空间 id → 目录。侧栏一次性拼 `workspace` 用。
@@ -955,11 +1032,14 @@ impl AgentService {
         // 期间不该阻塞用户去改配置。
         let (provider, model, max_tokens) = self.agent_parts();
 
-        // 工作区在整轮内**快照**（A-12）：从这里往下只认 `workspace`，
+        // 工作区在整轮内**快照**（A-12）：从这里往下只认 `roots`，
         // 不再看 `active` 锁。这样即便切换请求漏进来，也不会出现
         // 「前半段在 A 目录、后半段在 B 目录」。
-        let workspace = self.workspace();
-        let policy = Policy::new(self.mode(), &workspace);
+        //
+        // 快照的单位是**整份根集合**，不只是主目录：附加目录也是 jail 的一部分，
+        // 只快照主根会让"附加目录在中途变了"这件事从 side door 溜进来。
+        let roots = self.roots();
+        let policy = Policy::with_roots(self.mode(), roots);
         let agent = AgentLoop::new(
             provider,
             Arc::clone(&self.tools),

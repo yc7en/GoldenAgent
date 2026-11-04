@@ -144,3 +144,59 @@ async fn upgrade_runs_twice_without_duplicating() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].title, "只此一条");
 }
+
+/// B17 的 `spaces.json` 里没有 `extra_paths` 字段。
+///
+/// 升级后必须读得进来、每个空间都退化成单根，而且照常能切、能聊。
+/// 这条守住"加字段不等于要迁移"——`#[serde(default)]` 就是全部的兼容成本，
+/// 如果哪天有人给它加个必填校验，这条会红。
+#[tokio::test]
+async fn b17_manifest_upgrades_to_single_root_spaces() {
+    let ws = Workspace::new();
+    let state = ws.state();
+    std::fs::create_dir_all(state.join("sessions")).unwrap();
+
+    let project = ws.path.join("repo");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(state.join("sessions/sp-1700000000000-abcd")).unwrap();
+
+    // 手工写一份 B17 时代的清单：没有 extra_paths。
+    std::fs::write(
+        state.join("spaces.json"),
+        format!(
+            r#"{{"version":1,"spaces":[
+                {{"id":"sp-1700000000000-abcd","name":"老仓库","path":{path:?},"created_at_ms":1700000000000}}
+            ]}}"#,
+            path = project.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let service = ws.service();
+    service.bootstrap().await.unwrap();
+
+    let spaces = service.spaces().await.unwrap();
+    assert_eq!(spaces.len(), 1, "旧清单里的空间不能丢");
+    assert!(spaces[0].extra_paths.is_empty(), "读出来该是空列表");
+    assert_eq!(spaces[0].path, project);
+
+    // 切过去：根集合只有一个，workspace() 与它一致。
+    service.set_active_space(Some(&spaces[0].id)).await.unwrap();
+    assert_eq!(service.roots(), vec![project.clone()]);
+    assert_eq!(service.workspace(), project);
+
+    // 还能继续聊。
+    service.new_session_in(Some(&spaces[0].id)).await;
+    let (sink, _rx) = EventSink::channel();
+    service.chat("升级之后还能说话吗", &sink).await.unwrap();
+    assert!(service.current_session().is_some());
+
+    // 加一个附加目录之后，旧清单被原地改写而不是另起一份。
+    let extra = ws.path.join("assets");
+    service
+        .update_space(&spaces[0].id, None, None, Some(&[extra.clone()]))
+        .await
+        .unwrap();
+    let raw = std::fs::read_to_string(state.join("spaces.json")).unwrap();
+    assert!(raw.contains("extra_paths"), "改写后应带上新字段: {raw}");
+}

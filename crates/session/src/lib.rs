@@ -16,7 +16,9 @@ mod space;
 mod store;
 
 pub use catalog::{Located, SessionCatalog};
-pub use space::{Space, SpaceStore, DEFAULT_SPACE_DIR, MANIFEST_FILE, SESSIONS_DIR};
+pub use space::{
+    Space, SpaceStore, DEFAULT_SPACE_DIR, MANIFEST_FILE, MAX_EXTRA_ROOTS, SESSIONS_DIR,
+};
 pub use store::{SearchHit, SessionHits, SessionStore, SessionSummary};
 
 #[derive(Debug, Clone, Default)]

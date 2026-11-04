@@ -3,7 +3,6 @@ use goldenagent_core::{Result, ToolKind, ToolSpec};
 use serde_json::{json, Value};
 
 use crate::glob::matches;
-use crate::jail::resolve;
 use crate::walk::walk_files;
 use crate::{required_str, Tool, ToolContext};
 
@@ -43,7 +42,7 @@ impl Tool for Grep {
 
     async fn run(&self, input: Value, ctx: &ToolContext) -> Result<String> {
         let pattern = required_str(&input, "pattern")?;
-        let start = resolve(&ctx.workspace, input.get("path").and_then(Value::as_str).unwrap_or("."))?;
+        let start = ctx.resolve(input.get("path").and_then(Value::as_str).unwrap_or("."))?;
         let filter = input.get("glob").and_then(Value::as_str);
         let ignore_case = input
             .get("ignore_case")

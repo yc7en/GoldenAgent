@@ -118,7 +118,7 @@ async fn space_crud_and_session_ownership() {
     service.bootstrap().await.unwrap();
 
     let project = ws.project("repo");
-    let space = service.create_space("仓库", &project).await.unwrap();
+    let space = service.create_space("仓库", &project, &[]).await.unwrap();
     assert_eq!(space.sessions, 0);
     assert!(project.is_dir());
 
@@ -128,13 +128,13 @@ async fn space_crud_and_session_ownership() {
     assert!(listed[0].available);
 
     // 重名（忽略大小写）被拒
-    assert!(service.create_space("仓库", &ws.project("other")).await.is_err());
+    assert!(service.create_space("仓库", &ws.project("other"), &[]).await.is_err());
     // 同一目录建两个空间被拒
-    assert!(service.create_space("另一个", &project).await.is_err());
+    assert!(service.create_space("另一个", &project, &[]).await.is_err());
 
     // 改名
     let renamed = service
-        .update_space(&space.id, Some("改名了"), None)
+        .update_space(&space.id, Some("改名了"), None, None)
         .await
         .unwrap();
     assert_eq!(renamed.name, "改名了");
@@ -165,7 +165,7 @@ async fn opening_a_session_activates_its_space() {
     service.bootstrap().await.unwrap();
 
     let project = ws.project("repo");
-    let space = service.create_space("仓库", &project).await.unwrap();
+    let space = service.create_space("仓库", &project, &[]).await.unwrap();
 
     let id = "1700000000001-bbbb";
     seed(&ws.state(), Some(&space.id), id, "打开我就该切空间");
@@ -190,19 +190,19 @@ async fn space_path_cannot_point_at_state_dir() {
 
     let state = ws.state();
     assert!(
-        service.create_space("状态目录", &state).await.is_err(),
+        service.create_space("状态目录", &state, &[]).await.is_err(),
         "指向 .goldenagent 必须被拒"
     );
     assert!(
         service
-            .create_space("会话目录", &state.join("sessions"))
+            .create_space("会话目录", &state.join("sessions"), &[])
             .await
             .is_err(),
         "指向状态目录的子目录也要被拒"
     );
 
     // 正常的项目目录不受影响
-    assert!(service.create_space("正常", &ws.project("ok")).await.is_ok());
+    assert!(service.create_space("正常", &ws.project("ok"), &[]).await.is_ok());
 }
 
 #[tokio::test]
@@ -215,7 +215,7 @@ async fn switching_is_rejected_while_running() {
     ));
     service.bootstrap().await.unwrap();
 
-    let space = service.create_space("仓库", &ws.project("repo")).await.unwrap();
+    let space = service.create_space("仓库", &ws.project("repo"), &[]).await.unwrap();
     let id = "1700000000002-cccc";
     seed(&ws.state(), Some(&space.id), id, "运行中别切我");
 
@@ -263,7 +263,7 @@ async fn archiving_current_session_starts_a_new_one_in_same_space() {
     service.bootstrap().await.unwrap();
 
     let project = ws.project("repo");
-    let space = service.create_space("仓库", &project).await.unwrap();
+    let space = service.create_space("仓库", &project, &[]).await.unwrap();
     let id = "1700000000003-dddd";
     seed(&ws.state(), Some(&space.id), id, "归档我");
 
@@ -295,7 +295,7 @@ async fn pin_rename_and_search_work_across_spaces() {
     let service = ws.service();
     service.bootstrap().await.unwrap();
 
-    let space = service.create_space("仓库", &ws.project("repo")).await.unwrap();
+    let space = service.create_space("仓库", &ws.project("repo"), &[]).await.unwrap();
     seed(&ws.state(), None, "1700000000004-eeee", "在任务里找 target 目录");
     seed(&ws.state(), Some(&space.id), "1700000000005-ffff", "在空间里找 target 文件");
 
@@ -334,7 +334,7 @@ async fn persistence_lands_in_the_active_space() {
     let ws = Workspace::new();
     let service = ws.service();
     service.bootstrap().await.unwrap();
-    let space = service.create_space("仓库", &ws.project("repo")).await.unwrap();
+    let space = service.create_space("仓库", &ws.project("repo"), &[]).await.unwrap();
 
     service.new_session_in(Some(&space.id)).await;
     let (sink, _rx) = goldenagent_loop::EventSink::channel();
@@ -353,4 +353,121 @@ async fn persistence_lands_in_the_active_space() {
         .join("_default")
         .join(format!("{id}.jsonl"))
         .exists());
+}
+
+// ---------------------------------------------------------------------------
+// B18 · 多根工作区
+// ---------------------------------------------------------------------------
+
+/// 切空间时附加根要跟着一起换（A-12 的快照单位是整份根集合）。
+#[tokio::test]
+async fn extra_roots_switch_together_with_the_space() {
+    let ws = Workspace::new();
+    let service = ws.service();
+    service.bootstrap().await.unwrap();
+
+    let project = ws.project("repo");
+    let assets = ws.project("assets");
+    let space = service
+        .create_space("仓库", &project, &[assets.clone()])
+        .await
+        .unwrap();
+
+    assert_eq!(service.roots(), vec![ws.default_ws()], "启动时只有主根");
+
+    service.set_active_space(Some(&space.id)).await.unwrap();
+    assert_eq!(
+        service.roots(),
+        vec![project.clone(), assets.clone()],
+        "主根在前、附加根在后"
+    );
+    assert_eq!(service.workspace(), project, "workspace() 仍只报主根");
+
+    service.set_active_space(None).await.unwrap();
+    assert_eq!(service.roots(), vec![ws.default_ws()], "回任务要清掉附加根");
+}
+
+/// 附加目录同样过状态目录安全闸。
+///
+/// 主目录指着项目目录、附加目录指着 `.goldenagent/sessions` 一样是
+/// "Agent 能改自己的会话记录"，只是绕了一手。
+#[tokio::test]
+async fn extra_path_cannot_point_at_state_dir() {
+    let ws = Workspace::new();
+    let service = ws.service();
+    service.bootstrap().await.unwrap();
+
+    let project = ws.project("repo");
+    let state = ws.state();
+
+    let err = service
+        .create_space("仓库", &project, &[state.join("sessions")])
+        .await
+        .expect_err("附加目录指向会话目录必须被拒");
+    assert!(err.to_string().contains("状态目录"), "{err}");
+
+    // 改空间时同样要拦。
+    let space = service.create_space("仓库", &project, &[]).await.unwrap();
+    assert!(service
+        .update_space(&space.id, None, None, Some(&[state.clone()]))
+        .await
+        .is_err());
+}
+
+/// 运行中不允许改附加目录——否则这一轮会在旧根集合里跑完、下一轮换掉。
+#[tokio::test]
+async fn changing_extra_roots_is_rejected_while_running() {
+    let ws = Workspace::new();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let service = Arc::new(AgentService::new(
+        ws.config(),
+        Arc::new(BlockingProvider { gate: gate.clone() }),
+    ));
+    service.bootstrap().await.unwrap();
+
+    let project = ws.project("repo");
+    let space = service.create_space("仓库", &project, &[]).await.unwrap();
+    service.set_active_space(Some(&space.id)).await.unwrap();
+
+    let busy = Arc::clone(&service);
+    let (sink, _rx) = goldenagent_loop::EventSink::channel();
+    let turn = tokio::spawn(async move { busy.chat("你好", &sink).await });
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let err = service
+        .update_space(&space.id, None, None, Some(&[ws.project("late")]))
+        .await
+        .expect_err("运行中改附加目录必须被拒");
+    assert!(err.to_string().contains("还在跑"), "{err}");
+
+    gate.add_permits(1);
+    let _ = turn.await;
+}
+
+/// 清空附加目录之后，同一空间退回单根。
+#[tokio::test]
+async fn clearing_extra_roots_returns_to_a_single_root() {
+    let ws = Workspace::new();
+    let service = ws.service();
+    service.bootstrap().await.unwrap();
+
+    let project = ws.project("repo");
+    let assets = ws.project("assets");
+    let space = service
+        .create_space("仓库", &project, &[assets])
+        .await
+        .unwrap();
+    service.set_active_space(Some(&space.id)).await.unwrap();
+    assert_eq!(service.roots().len(), 2);
+
+    let updated = service
+        .update_space(&space.id, None, None, Some(&[]))
+        .await
+        .unwrap();
+    assert!(updated.extra_paths.is_empty());
+    assert_eq!(
+        service.roots(),
+        vec![project],
+        "活动空间的根集合要同步收缩，而不是等下次切空间"
+    );
 }

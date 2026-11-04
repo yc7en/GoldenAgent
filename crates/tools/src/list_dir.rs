@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use goldenagent_core::{Error, Result, ToolKind, ToolSpec};
 use serde_json::{json, Value};
 
-use crate::jail::{display_relative, resolve};
+use crate::jail::display_relative;
 use crate::{Tool, ToolContext};
 
 /// 单次列出的条目上限，防止在一个巨型目录（如 node_modules）里打转。
@@ -31,7 +31,7 @@ impl Tool for ListDir {
             .get("path")
             .and_then(Value::as_str)
             .unwrap_or(".");
-        let dir = resolve(&ctx.workspace, raw)?;
+        let dir = ctx.resolve(raw)?;
 
         let meta = tokio::fs::metadata(&dir)
             .await
