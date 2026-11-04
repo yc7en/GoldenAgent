@@ -11,9 +11,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use goldenagent_core::{ContentBlock, Error, Message, Result};
 
+mod catalog;
+mod space;
 mod store;
 
-pub use store::{SessionStore, SessionSummary};
+pub use catalog::{Located, SessionCatalog};
+pub use space::{Space, SpaceStore, DEFAULT_SPACE_DIR, MANIFEST_FILE, SESSIONS_DIR};
+pub use store::{SearchHit, SessionHits, SessionStore, SessionSummary};
 
 #[derive(Debug, Clone, Default)]
 pub struct Session {

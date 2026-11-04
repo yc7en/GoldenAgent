@@ -46,6 +46,8 @@ export interface Snapshot {
   /** 实际会发给厂商的模型名。 */
   model: string;
   workspace: string;
+  /** 当前活动空间；null = 「任务」（默认空间）。 */
+  active_space_id: string | null;
   messages: number;
   pending_permissions: number;
   /** 当前会话 id；新会话还没说过话时是 null。 */
@@ -54,6 +56,8 @@ export interface Snapshot {
   provider_state: ProviderStateName;
   /** 仅 degraded 时有值。 */
   provider_reason: string | null;
+  /** 空间清单读取时遇到的问题（读坏、版本过高）。不阻断使用。 */
+  spaces_warning: string | null;
   /** 应用版本。 */
   version: string;
 }
@@ -106,12 +110,64 @@ export interface ChatReport {
   turns: number;
 }
 
-/** 一条历史会话在侧栏里的样子。对应 `crates/session/src/store.rs` 的 `SessionSummary`。 */
+/** 一条历史会话在侧栏里的样子。对应 `src-tauri` 的 `SessionDto`。 */
 export interface SessionSummary {
   id: string;
   title: string;
   messages: number;
   updated_at_ms: number;
+  /** 归属空间；null = 「任务」。 */
+  space_id: string | null;
+  /** 所属空间的工作目录。菜单里的路径小字与「打开文件夹」都看它。 */
+  workspace: string;
+  pinned: boolean;
+  archived: boolean;
+}
+
+/** 一个空间。`path` 是工具 jail 的根，也是「在哪儿干活」的答案。 */
+export interface SpaceInfo {
+  id: string;
+  name: string;
+  path: string;
+  /** 该空间下的会话数（含已归档）。 */
+  sessions: number;
+  /** 目录还在不在。盘符没挂载时是 false。 */
+  available: boolean;
+  created_at_ms: number;
+}
+
+/** 全局搜索的一处命中。定位用 (msg, block)，不是「渲染出来的第几条」。 */
+export interface SearchHit {
+  msg: number;
+  block: number;
+  role: "user" | "assistant";
+  snippet: string;
+}
+
+/** 一条会话的搜索结果。 */
+export interface SessionHits {
+  session_id: string;
+  title: string;
+  space_id: string | null;
+  updated_at_ms: number;
+  hits: SearchHit[];
+}
+
+/**
+ * 事件信封。
+ *
+ * `core::Event` 一个字段都没改，壳在外面包了一层：前端按 `session_id`
+ * 过滤，就不必再靠「busy 时禁止切会话」来保证不串台；`seq` 用来发现丢帧。
+ */
+export interface EventEnvelope {
+  session_id: string | null;
+  seq: number;
+  event: AgentEvent;
+}
+
+/** 「打开文件夹」的返回：后端实际打开的目录。 */
+export interface DeleteReport {
+  moved: number;
 }
 
 /**

@@ -17,7 +17,7 @@ use goldenagent_core::{Error, Result};
 use goldenagent_loop::{AgentLoop, Cancellation, Config};
 use goldenagent_policy::Policy;
 use goldenagent_provider::{MockProvider, Provider, ProviderConfig};
-use goldenagent_session::{Session, SessionStore};
+use goldenagent_session::{Session, SessionCatalog, SessionStore, SpaceStore};
 use goldenagent_tools::Registry;
 use tokio::sync::Mutex;
 
@@ -34,12 +34,12 @@ pub use workspace::{resolve as resolve_workspace, WorkspaceOrigin};
 pub use goldenagent_core::{Event, Message};
 pub use goldenagent_loop::{EventSink, Outcome};
 pub use goldenagent_policy::Mode;
-pub use goldenagent_session::SessionSummary;
+pub use goldenagent_session::{SessionHits, SessionSummary as SessionEntry, DEFAULT_SPACE_DIR};
 
 /// 一次会话的装配参数。
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    /// 工具能碰的根目录。同时是路径越界的判定基准。
+    /// 工具能碰的根目录。**这是默认工作区**：没有空间时（「任务」）就用它。
     pub workspace: PathBuf,
     pub model: String,
     pub system: String,
@@ -53,6 +53,9 @@ pub struct AgentConfig {
     pub approval_timeout: Duration,
     /// 会话目录。`None` 表示纯内存，不落盘、也不提供历史列表。
     pub session_dir: Option<PathBuf>,
+    /// 应用状态目录（`.goldenagent`）：放 `spaces.json` 与 `sessions/`。
+    /// 它同时是空间路径的禁区——Agent 不该能改自己的会话与明文 key。
+    pub state_dir: Option<PathBuf>,
 }
 
 impl AgentConfig {
@@ -69,6 +72,7 @@ impl AgentConfig {
             mode: Mode::Ask,
             approval_timeout: Duration::from_secs(120),
             session_dir: None,
+            state_dir: None,
         }
     }
 
@@ -78,7 +82,17 @@ impl AgentConfig {
     }
 
     pub fn with_session_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.session_dir = Some(dir.into());
+        let dir = dir.into();
+        self.state_dir = dir.parent().map(Path::to_path_buf);
+        self.session_dir = Some(dir);
+        self
+    }
+
+    /// 按应用状态目录装配：会话在 `<state>/sessions/`，空间清单在 `<state>/spaces.json`。
+    pub fn with_state_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        self.session_dir = Some(dir.join(goldenagent_session::SESSIONS_DIR));
+        self.state_dir = Some(dir);
         self
     }
 
@@ -117,6 +131,44 @@ struct ProviderRuntime {
     env_key: Option<String>,
 }
 
+/// 当前在哪个空间干活。
+///
+/// `path` 是工具 jail 的根。它随空间切换，但**一轮对话内绝不变化**（A-12）：
+/// `chat()` 开头把它快照成局部变量，整轮不再看锁。
+#[derive(Debug, Clone)]
+struct ActiveWorkspace {
+    /// `None` = 「任务」（默认空间）。
+    space_id: Option<String>,
+    path: PathBuf,
+}
+
+/// 一个空间在界面上的样子。
+#[derive(Debug, Clone)]
+pub struct SpaceInfo {
+    pub id: String,
+    pub name: String,
+    pub path: PathBuf,
+    pub created_at_ms: u64,
+    /// 该空间下的会话数（含已归档）。
+    pub sessions: usize,
+    /// 目录还在不在。盘符没挂载时是 `false`。
+    pub available: bool,
+}
+
+/// 一条会话在界面上的样子。比存储层多一个 `workspace`——
+/// 会话层不知道工作目录，那个信息由空间清单补齐。
+#[derive(Debug, Clone)]
+pub struct SessionItem {
+    pub id: String,
+    pub title: String,
+    pub messages: usize,
+    pub updated_at_ms: u64,
+    pub space_id: Option<String>,
+    pub workspace: PathBuf,
+    pub pinned: bool,
+    pub archived: bool,
+}
+
 pub struct AgentService {
     provider: RwLock<ProviderRuntime>,
     tools: Arc<Registry>,
@@ -124,15 +176,21 @@ pub struct AgentService {
     /// 权限模式可以被前端随时改，所以不放进 AgentLoop。
     mode: RwLock<Mode>,
     session: Mutex<Session>,
-    /// 会话目录。`None` = 纯内存模式（测试、临时会话）。
-    store: Option<SessionStore>,
+    /// 会话目录（按空间分区）。`None` = 纯内存模式（测试、临时会话）。
+    catalog: Option<SessionCatalog>,
+    /// 空间清单。与 `catalog` 同生同灭。
+    space_store: Option<SpaceStore>,
+    /// 启动时清单读取遇到的问题。读坏不是致命错误，但界面要知道。
+    spaces_warning: StdMutex<Option<String>>,
     /// 当前会话 id。**第一次落盘时才生成**——否则用户每点一次"新对话"
     /// 就在列表里留下一个空壳。
     ///
     /// 与 `session` 一起用时，永远先锁 `session` 再锁这个，不要反过来。
     session_id: StdMutex<Option<String>>,
-    /// 当前正在跑的那一轮的取消标记。
+    /// 当前正在跑的那一轮的取消标记。它同时是"忙不忙"的唯一判据。
     current_cancel: StdMutex<Option<Cancellation>>,
+    /// 活动工作区。锁序：**active → session → session_id**，新的锁放最外层。
+    active: RwLock<ActiveWorkspace>,
     approver: Arc<EventApprover>,
 }
 
@@ -140,7 +198,17 @@ impl AgentService {
     pub fn new(config: AgentConfig, provider: Arc<dyn Provider>) -> Self {
         let approver = Arc::new(EventApprover::new(config.approval_timeout));
         let mode = config.mode;
-        let store = config.session_dir.clone().map(SessionStore::new);
+        let catalog = config.session_dir.clone().map(SessionCatalog::new);
+        // 会话目录可以自定义（测试里是 `.sessions`），所以不能简单按
+        // `<state>/sessions` 推导，否则清单说一套、会话在另一套。
+        let space_store = config.state_dir.clone().map(|dir| match &config.session_dir {
+            Some(sessions) => SpaceStore::with_sessions_root(dir, sessions.clone()),
+            None => SpaceStore::new(dir),
+        });
+        let active = ActiveWorkspace {
+            space_id: None,
+            path: config.workspace.clone(),
+        };
         let runtime = ProviderRuntime {
             provider,
             config: ProviderConfig::mock(),
@@ -159,9 +227,12 @@ impl AgentService {
             config,
             mode: RwLock::new(mode),
             session: Mutex::new(Session::new()),
-            store,
+            catalog,
+            space_store,
+            spaces_warning: StdMutex::new(None),
             session_id: StdMutex::new(None),
             current_cancel: StdMutex::new(None),
+            active: RwLock::new(active),
             approver,
         }
     }
@@ -331,8 +402,28 @@ impl AgentService {
         Self::new(config, Arc::new(MockProvider::default()))
     }
 
-    pub fn workspace(&self) -> &Path {
-        &self.config.workspace
+    /// 当前**活动**工作区。没有空间时就是启动时解析出的默认工作区。
+    pub fn workspace(&self) -> PathBuf {
+        match self.active.read() {
+            Ok(active) => active.path.clone(),
+            Err(poisoned) => poisoned.into_inner().path.clone(),
+        }
+    }
+
+    /// 当前活动空间。`None` = 「任务」。
+    pub fn active_space(&self) -> Option<String> {
+        match self.active.read() {
+            Ok(active) => active.space_id.clone(),
+            Err(poisoned) => poisoned.into_inner().space_id.clone(),
+        }
+    }
+
+    /// 是否有一轮正在跑。切空间/切会话/删空间都要先问它（A-12）。
+    pub fn is_busy(&self) -> bool {
+        self.current_cancel
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
     }
 
     pub fn provider_id(&self) -> &'static str {
@@ -390,10 +481,191 @@ impl AgentService {
         self.session.lock().await.len()
     }
 
+    // ───────────────────────── 空间 ─────────────────────────
+
+    /// 启动时备好状态目录、清单与旧布局迁移。返回清单问题（没有就是 `None`）。
+    pub async fn bootstrap(&self) -> Result<Option<String>> {
+        let Some(store) = &self.space_store else {
+            return Ok(None);
+        };
+        let warning = store.bootstrap().await?;
+        if let Ok(mut slot) = self.spaces_warning.lock() {
+            *slot = warning.clone();
+        }
+        Ok(warning)
+    }
+
+    /// 清单读取时遇到的问题。界面在设置页显示它，但不阻断使用。
+    pub fn spaces_warning(&self) -> Option<String> {
+        self.spaces_warning
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    /// 全部空间（不含「任务」——它不是清单项，是默认值）。
+    pub async fn spaces(&self) -> Result<Vec<SpaceInfo>> {
+        let store = self.space_store()?;
+        let catalog = store.catalog();
+        let mut out = Vec::new();
+        for space in store.list().await? {
+            let sessions = catalog
+                .list(Some(&space.id), true)
+                .await
+                .map(|list| list.len())
+                .unwrap_or(0);
+            out.push(SpaceInfo {
+                available: SpaceStore::is_available(&space),
+                sessions,
+                id: space.id,
+                name: space.name,
+                path: space.path,
+                created_at_ms: space.created_at_ms,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 新建空间。名字查重在存储层，这里只做「不能指向应用状态目录」这道安全闸。
+    pub async fn create_space(&self, name: &str, path: &Path) -> Result<SpaceInfo> {
+        self.guard_space_path(path)?;
+        let store = self.space_store()?;
+        let space = store.create(name, path).await?;
+        Ok(SpaceInfo {
+            available: true,
+            sessions: 0,
+            id: space.id,
+            name: space.name,
+            path: space.path,
+            created_at_ms: space.created_at_ms,
+        })
+    }
+
+    /// 改名 / 换目录。活动空间换目录时必须空闲——否则这一轮会在旧目录里跑完，
+    /// 而下一轮突然换到新目录，同一个任务的读写跨越两个地方。
+    pub async fn update_space(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        path: Option<&Path>,
+    ) -> Result<SpaceInfo> {
+        if let Some(path) = path {
+            self.guard_space_path(path)?;
+            if self.active_space().as_deref() == Some(id) && self.is_busy() {
+                return Err(Error::Session(
+                    "这一轮还在跑，先停下再换空间目录".into(),
+                ));
+            }
+        }
+
+        let store = self.space_store()?;
+        let space = store.update(id, name, path).await?;
+
+        // 活动空间的目录变了，活动工作区跟着变；否则界面切换了、工具还在老地方。
+        if self.active_space().as_deref() == Some(id) {
+            if let Ok(mut active) = self.active.write() {
+                active.path = space.path.clone();
+            }
+        }
+
+        let sessions = store
+            .catalog()
+            .list(Some(id), true)
+            .await
+            .map(|list| list.len())
+            .unwrap_or(0);
+        Ok(SpaceInfo {
+            available: SpaceStore::is_available(&space),
+            sessions,
+            id: space.id,
+            name: space.name,
+            path: space.path,
+            created_at_ms: space.created_at_ms,
+        })
+    }
+
+    /// 删除空间：会话移回「任务」，只删应用状态目录里的东西。返回搬走的会话数。
+    pub async fn delete_space(&self, id: &str) -> Result<usize> {
+        if self.is_busy() {
+            return Err(Error::Session("这一轮还在跑，先停下再删空间".into()));
+        }
+        let store = self.space_store()?;
+        let moved = store.delete(id).await?;
+
+        // 正在这个空间里：切回「任务」，并把当前会话重新定位（它已经被搬过去了）。
+        if self.active_space().as_deref() == Some(id) {
+            if let Ok(mut active) = self.active.write() {
+                active.space_id = None;
+                active.path = self.config.workspace.clone();
+            }
+            if let Some(current) = self.current_session() {
+                // 会话已经被搬到「任务」目录；重新打开一次，让 session_id 与归属对齐。
+                if self.open_session(&current).await.is_err() {
+                    self.new_session_in(None).await;
+                }
+            }
+        }
+        Ok(moved)
+    }
+
+    /// 切换活动空间。运行中拒绝（A-12）。
+    pub async fn set_active_space(&self, id: Option<&str>) -> Result<()> {
+        if self.is_busy() {
+            return Err(Error::Session("这一轮还在跑，先停下再切空间".into()));
+        }
+        let path = self.workspace_for(id).await?;
+        if let Ok(mut active) = self.active.write() {
+            active.space_id = id.map(str::to_string);
+            active.path = path;
+        }
+        Ok(())
+    }
+
+    /// 「打开文件夹」的落点：由后端算，不接受前端传路径。
+    ///
+    /// 会话 → 它所属空间的工作目录；这样不会出现「前端传 `C:\Windows` 让后端打开」
+    /// 这类越权面。
+    pub async fn reveal_session(&self, id: &str) -> Result<PathBuf> {
+        let located = self
+            .catalog()?
+            .locate(id)
+            .await?
+            .ok_or_else(|| Error::Session(format!("会话 {id} 不存在")))?;
+        self.workspace_for(located.space_id.as_deref()).await
+    }
+
+    pub async fn reveal_space(&self, id: &str) -> Result<PathBuf> {
+        let space = self
+            .space_store()?
+            .get(id)
+            .await?
+            .ok_or_else(|| Error::Session(format!("空间 {id} 不存在")))?;
+        Ok(space.path)
+    }
+
+    // ───────────────────────── 会话 ─────────────────────────
+
     /// 开一段新会话：清历史、丢掉当前 id。旧会话仍在磁盘上，随时能翻回去。
     ///
     /// 不预建文件——第一次 `chat` 落盘时才真正生成 id 与文件。
     pub async fn new_session(&self) {
+        self.new_session_in(None).await
+    }
+
+    /// 在指定空间里开新会话，并把它设为活动空间。
+    pub async fn new_session_in(&self, space_id: Option<&str>) {
+        if let Ok(mut active) = self.active.write() {
+            // 空间不存在时不要留一个指向不存在目录的活动工作区：
+            // 回落到默认工作区，比让第一次工具调用报「路径不存在」好排查。
+            active.space_id = space_id.map(str::to_string);
+            active.path = match space_id {
+                None => self.config.workspace.clone(),
+                Some(_) => self
+                    .workspace_for_blocking(space_id)
+                    .unwrap_or_else(|| self.config.workspace.clone()),
+            };
+        }
+
         self.session.lock().await.clear();
         if let Ok(mut slot) = self.session_id.lock() {
             *slot = None;
@@ -405,20 +677,89 @@ impl AgentService {
         self.session_id.lock().ok().and_then(|slot| slot.clone())
     }
 
+    /// 确保当前会话有 id，返回它。
+    ///
+    /// 事件信封要一个稳定的会话标识，而 id 本来要等第一次落盘才生成。
+    /// 这里提前定下 id 但**不建文件**：空会话仍然不会出现在列表里，
+    /// 只是「id 已经许出去了」。
+    pub fn ensure_session_id(&self) -> Option<String> {
+        let mut slot = self.session_id.lock().ok()?;
+        if slot.is_none() && self.catalog.is_some() {
+            *slot = Some(SessionStore::new_id());
+        }
+        slot.clone()
+    }
+
     /// 历史会话列表，最近改过的在前。
-    pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
-        self.session_store()?.list().await
+    ///
+    /// `space_id == None` → 全部空间；`Some(id)` → 只看这个空间。
+    pub async fn list_sessions(
+        &self,
+        space_id: Option<&str>,
+        include_archived: bool,
+    ) -> Result<Vec<SessionItem>> {
+        let catalog = self.catalog()?;
+        let summaries = catalog.list(space_id, include_archived).await?;
+
+        // 空间清单只读一次：每条会话都去查一遍会让侧栏首屏变成 N 次磁盘读。
+        let paths = self.space_paths().await?;
+        Ok(summaries
+            .into_iter()
+            .map(|summary| {
+                let workspace = summary
+                    .space_id
+                    .as_ref()
+                    .and_then(|id| paths.get(id).cloned())
+                    .unwrap_or_else(|| self.config.workspace.clone());
+                SessionItem {
+                    id: summary.id,
+                    title: summary.title,
+                    messages: summary.messages,
+                    updated_at_ms: summary.updated_at_ms,
+                    space_id: summary.space_id,
+                    workspace,
+                    pinned: summary.pinned,
+                    archived: summary.archived,
+                }
+            })
+            .collect())
     }
 
     /// 打开一条历史会话，返回它有多少条消息。
     ///
-    /// 打开动作本身不写盘；只有下一次 `chat` 才会把（可能被压缩过的）历史写回去。
+    /// **事务化**（A-11）：定位归属 → 读盘 → 检查忙闲 → 切工作区 → 替换内存会话。
+    /// 顺序是刻意的：
+    /// - 读盘在忙闲检查之前，因为「运行中切换」报错时不该先做一次无谓的磁盘读；
+    /// - 切工作区在替换会话之前，且读失败时**什么都不改**，绝不留半状态。
     pub async fn open_session(&self, id: &str) -> Result<usize> {
-        let store = self.session_store()?;
-        let loaded = store.load(id).await?;
+        let catalog = self.catalog()?;
+        let located = catalog
+            .locate(id)
+            .await?
+            .ok_or_else(|| Error::Session(format!("会话 {id} 不存在")))?;
+
+        let loaded = Session::load(&located.path).await?;
         let count = loaded.len();
 
-        // 锁序：先 session 再 session_id。反过来会和 chat 里的顺序相反，形成死锁。
+        if self.is_busy() {
+            return Err(Error::Session(
+                "这一轮还在跑，先停下或等它结束再切会话".into(),
+            ));
+        }
+
+        // 空间可能已经在清单里被删、但会话文件还没搬（异常中断）。
+        // 这时按默认工作区打开，至少历史还能看，不会「点得开却报错」。
+        let path = self
+            .workspace_for(located.space_id.as_deref())
+            .await
+            .unwrap_or_else(|_| self.config.workspace.clone());
+
+        if let Ok(mut active) = self.active.write() {
+            active.space_id = located.space_id.clone();
+            active.path = path;
+        }
+
+        // 锁序：active 已在上面写过又放开，这里是 session → session_id。
         let mut session = self.session.lock().await;
         *session = loaded;
         drop(session);
@@ -430,25 +771,64 @@ impl AgentService {
     }
 
     pub async fn rename_session(&self, id: &str, title: &str) -> Result<String> {
-        self.session_store()?.rename(id, title).await
+        self.store_for(id).await?.rename(id, title).await
     }
 
-    /// 删掉一条历史会话。删的是当前会话时，顺手切到一段新会话。
+    /// 删掉一条历史会话（归档区的「永久删除」）。删的是当前会话时，顺手开一段新的。
     pub async fn delete_session(&self, id: &str) -> Result<bool> {
-        let removed = self.session_store()?.delete(id).await?;
+        let store = self.store_for(id).await?;
+        let removed = store.delete(id).await?;
         if self.current_session().as_deref() == Some(id) {
-            self.new_session().await;
+            let space = self.active_space();
+            self.new_session_in(space.as_deref()).await;
         }
         Ok(removed)
     }
 
-    /// 启动时接上次：打开最近一条会话。没有历史就什么都不做。
-    ///
-    /// 另外顺手把 B10 及以前的单文件 `session.jsonl` 收编进来——
-    /// 老用户升级后历史不该凭空消失。
+    /// 置顶 / 取消置顶。只写标记，不动内存会话，运行中也允许。
+    pub async fn pin_session(&self, id: &str, pinned: bool) -> Result<bool> {
+        self.store_for(id).await?.set_pinned(id, pinned).await
+    }
+
+    /// 归档 / 取消归档。归档当前会话会切到同空间的一段新会话。
+    pub async fn archive_session(&self, id: &str, archived: bool) -> Result<bool> {
+        if archived && self.current_session().as_deref() == Some(id) && self.is_busy() {
+            return Err(Error::Session("这一轮还在跑，先停下再归档当前会话".into()));
+        }
+
+        let store = self.store_for(id).await?;
+        let result = store.set_archived(id, archived).await?;
+
+        if archived && self.current_session().as_deref() == Some(id) {
+            let space = self.active_space();
+            self.new_session_in(space.as_deref()).await;
+        }
+        Ok(result)
+    }
+
+    /// 跨全部空间的正文搜索。归档会话默认不参与。
+    pub async fn search_sessions(
+        &self,
+        query: &str,
+        include_archived: bool,
+    ) -> Result<Vec<SessionHits>> {
+        self.catalog()?.search(query, include_archived).await
+    }
+
+    /// 启动时接上次：打开最近一条**未归档**会话（含它所在的空间，A-11）。
     pub async fn restore(&self) -> Result<bool> {
-        let store = self.session_store()?;
-        let latest = store.list().await?.into_iter().next();
+        let catalog = self.catalog()?;
+
+        // 兜底迁移：`restore()` 是「开程序」这条路上的最后一步，也是唯一
+        // 一定会被调到的地方（bootstrap 由外壳调用，测试/CLI 未必）。
+        // 一次 readdir 的代价，换「旧布局一定能被看见」。
+        catalog.migrate_flat().await.ok();
+
+        let latest = catalog
+            .list(None, false)
+            .await?
+            .into_iter()
+            .find(|summary| !summary.archived);
         match latest {
             Some(summary) => {
                 self.open_session(&summary.id).await?;
@@ -458,20 +838,102 @@ impl AgentService {
         }
     }
 
-    /// 迁移旧的单文件会话。返回迁移出来的会话 id（没有可迁移的就 `None`）。
+    /// 迁移旧的单文件会话（B10 及以前）。返回迁移出来的会话 id。
     pub async fn adopt_legacy(&self, legacy: impl AsRef<Path>) -> Result<Option<String>> {
-        self.session_store()?.adopt_legacy(legacy).await
+        self.catalog()?.store(None).adopt_legacy(legacy).await
     }
 
-    fn session_store(&self) -> Result<&SessionStore> {
-        self.store
+    // ───────────────────────── 内部 ─────────────────────────
+
+    fn catalog(&self) -> Result<&SessionCatalog> {
+        self.catalog
             .as_ref()
             .ok_or_else(|| Error::Session("没有配置会话目录，历史功能不可用".into()))
     }
 
+    fn space_store(&self) -> Result<&SpaceStore> {
+        self.space_store
+            .as_ref()
+            .ok_or_else(|| Error::Session("没有配置状态目录，空间功能不可用".into()))
+    }
+
+    /// 找一条会话所在的存储句柄。改名/置顶/归档/删除都要先定位。
+    async fn store_for(&self, id: &str) -> Result<SessionStore> {
+        let catalog = self.catalog()?;
+        let located = catalog
+            .locate(id)
+            .await?
+            .ok_or_else(|| Error::Session(format!("会话 {id} 不存在")))?;
+        Ok(catalog.store(located.space_id.as_deref()))
+    }
+
+    /// 空间 id → 工作目录。`None` 就是默认工作区。
+    async fn workspace_for(&self, space_id: Option<&str>) -> Result<PathBuf> {
+        match space_id {
+            None => Ok(self.config.workspace.clone()),
+            Some(id) => {
+                let space = self
+                    .space_store()?
+                    .get(id)
+                    .await?
+                    .ok_or_else(|| Error::Session(format!("空间 {id} 不存在")))?;
+                Ok(space.path)
+            }
+        }
+    }
+
+    /// `new_session_in` 是 async 上下文里的同步函数，不能 await，只能同步读清单。
+    fn workspace_for_blocking(&self, space_id: Option<&str>) -> Option<PathBuf> {
+        let id = space_id?;
+        let store = self.space_store.as_ref()?;
+        let file = std::fs::read_to_string(store.manifest_path()).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&file).ok()?;
+        value
+            .get("spaces")?
+            .as_array()?
+            .iter()
+            .find(|space| space.get("id").and_then(|v| v.as_str()) == Some(id))
+            .and_then(|space| space.get("path"))
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+    }
+
+    /// 空间 id → 目录。侧栏一次性拼 `workspace` 用。
+    async fn space_paths(&self) -> Result<std::collections::HashMap<String, PathBuf>> {
+        let Some(store) = &self.space_store else {
+            return Ok(Default::default());
+        };
+        Ok(store
+            .list()
+            .await?
+            .into_iter()
+            .map(|space| (space.id, space.path))
+            .collect())
+    }
+
+    /// 空间路径的安全闸：不能指向应用状态目录或其子目录。
+    ///
+    /// 放行的话，Agent 就能改自己的会话、甚至 `provider.json` 里的明文 key。
+    /// 盘根是另一回事（决策 2）：允许，由前端二次确认，不在这里硬禁。
+    fn guard_space_path(&self, path: &Path) -> Result<()> {
+        let Some(state_dir) = &self.config.state_dir else {
+            return Ok(());
+        };
+        if is_inside(path, state_dir) {
+            return Err(Error::Session(format!(
+                "空间目录不能指向应用状态目录 {}（Agent 不该能改自己的会话）",
+                state_dir.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// 落盘。第一次调用时才分配 id。
+    ///
+    /// 落在**活动空间**的目录里：归属由位置决定（A-13），
+    /// 所以这里的 space 一旦写错，会话就会「跑到另一个空间去」。
     async fn persist_locked(&self, session: &Session) -> Result<()> {
-        let Some(store) = &self.store else {
+        let Some(catalog) = &self.catalog else {
             return Ok(());
         };
 
@@ -479,7 +941,8 @@ impl AgentService {
             Ok(mut slot) => slot.get_or_insert_with(SessionStore::new_id).clone(),
             Err(_) => return Ok(()),
         };
-        store.persist(&id, session).await
+        let space_id = self.active_space();
+        catalog.store(space_id.as_deref()).persist(&id, session).await
     }
 
     /// 跑一轮对话。进度只从 `events` 出去，历史只从 `session` 出来。
@@ -488,7 +951,11 @@ impl AgentService {
         // 期间不该阻塞用户去改配置。
         let (provider, model, max_tokens) = self.agent_parts();
 
-        let policy = Policy::new(self.mode(), &self.config.workspace);
+        // 工作区在整轮内**快照**（A-12）：从这里往下只认 `workspace`，
+        // 不再看 `active` 锁。这样即便切换请求漏进来，也不会出现
+        // 「前半段在 A 目录、后半段在 B 目录」。
+        let workspace = self.workspace();
+        let policy = Policy::new(self.mode(), &workspace);
         let agent = AgentLoop::new(
             provider,
             Arc::clone(&self.tools),
@@ -546,4 +1013,22 @@ impl AgentService {
             }
         }
     }
+}
+
+/// `path` 是否落在 `base` 之内（含相等）。
+///
+/// 能 canonicalize 就比 canonicalize 后的路径，能认 `C://a//..//b` 这类；
+/// 不能（路径还不存在）就比词法路径，Windows 下忽略大小写。
+fn is_inside(path: &Path, base: &Path) -> bool {
+    let (path, base) = match (path.canonicalize(), base.canonicalize()) {
+        (Ok(path), Ok(base)) => (path, base),
+        _ => (path.to_path_buf(), base.to_path_buf()),
+    };
+
+    if cfg!(windows) {
+        let path = path.to_string_lossy().to_lowercase();
+        let base = base.to_string_lossy().to_lowercase();
+        return path == base || path.starts_with(&format!("{}\\", base.trim_end_matches('\\')));
+    }
+    path == base || path.starts_with(&base)
 }

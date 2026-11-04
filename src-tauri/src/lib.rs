@@ -4,18 +4,23 @@
 //!
 //! 1. 建 `AppState`（持 `AgentService`）；
 //! 2. 把前端 `invoke` 原样转成 service 调用；
-//! 3. 把 service 的事件流原样转成 `emit("agent://event")`。
+//! 3. 把 service 的事件流包成 envelope 后 `emit("agent://event")`。
 //!
 //! **这里不许出现业务判断**：不放权限逻辑、不放重试策略、不读会话文件。
 //! 想加功能，加在下面某一层里，别加在这儿——否则半年后它就会长成第二个引擎。
+//!
+//! 唯一的例外是 `reveal_session` 的**路径来源**：它不接受前端传路径，
+//! 只接受 id，路径由 app 层算。否则这里就成了「前端让后端打开任意目录」的越权面。
 
 use std::sync::Arc;
 
 use goldenagent_app::{
-    AgentConfig, AgentService, EventSink, Message, Mode, Outcome, ProviderInput, ProviderSetup,
+    AgentConfig, AgentService, Event, EventSink, Message, Mode, Outcome, ProviderInput,
+    ProviderSetup, SessionHits, SessionItem, SpaceInfo,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
+use tauri_plugin_opener::OpenerExt;
 
 /// 后端 → 前端唯一的事件通道名。前端 `listen` 这个名字。
 pub const EVENT_CHANNEL: &str = "agent://event";
@@ -24,12 +29,27 @@ struct AppState {
     service: Arc<AgentService>,
 }
 
+/// 事件信封。
+///
+/// `core::Event` 本身一个字段都没改（A-3 不破），这里只加一层壳：
+/// 前端按 `session_id` 过滤，就不必再靠「busy 时禁止切会话」来保证不串台。
+/// `seq` 用来发现丢帧——`emit` 失败时不会静默。
+#[derive(Clone, Serialize)]
+struct EventEnvelope {
+    /// 这条事件属于哪个会话。极端情况下为 `null`（无落盘能力的纯内存装配）。
+    session_id: Option<String>,
+    seq: u64,
+    event: Event,
+}
+
 #[derive(Serialize)]
 struct Snapshot {
     mode: String,
     provider: String,
     model: String,
     workspace: String,
+    /// 当前活动空间；`null` = 「任务」。
+    active_space_id: Option<String>,
     messages: usize,
     pending_permissions: usize,
     /// 当前会话 id；新会话还没说过话时是 null。
@@ -41,11 +61,13 @@ struct Snapshot {
     provider_state: String,
     /// 仅 `degraded` 时有值。
     provider_reason: Option<String>,
+    /// 空间清单读取时遇到的问题（读坏、版本过高）。不阻断使用。
+    spaces_warning: Option<String>,
     /// 应用版本，显示在设置面板里。
     version: String,
 }
 
-/// 会话列表项。刻意不直接把 `SessionSummary` 序列化出去——
+/// 会话列表项。刻意不直接把 `SessionItem` 序列化出去——
 /// 这一层的字段名就是前后端契约，改它要连着 `src/types.ts` 一起改。
 #[derive(Serialize)]
 struct SessionDto {
@@ -53,6 +75,89 @@ struct SessionDto {
     title: String,
     messages: usize,
     updated_at_ms: u64,
+    /// `null` = 「任务」。
+    space_id: Option<String>,
+    /// 该会话所属空间的工作目录。菜单里的路径小字与「打开文件夹」都看它。
+    workspace: String,
+    pinned: bool,
+    archived: bool,
+}
+
+impl From<SessionItem> for SessionDto {
+    fn from(item: SessionItem) -> Self {
+        Self {
+            id: item.id,
+            title: item.title,
+            messages: item.messages,
+            updated_at_ms: item.updated_at_ms,
+            space_id: item.space_id,
+            workspace: item.workspace.display().to_string(),
+            pinned: item.pinned,
+            archived: item.archived,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SpaceDto {
+    id: String,
+    name: String,
+    path: String,
+    sessions: usize,
+    /// 目录还在不在。盘符没挂载时是 `false`，界面要标灰。
+    available: bool,
+    created_at_ms: u64,
+}
+
+impl From<SpaceInfo> for SpaceDto {
+    fn from(space: SpaceInfo) -> Self {
+        Self {
+            id: space.id,
+            name: space.name,
+            path: space.path.display().to_string(),
+            sessions: space.sessions,
+            available: space.available,
+            created_at_ms: space.created_at_ms,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SearchHitDto {
+    msg: usize,
+    block: usize,
+    role: String,
+    snippet: String,
+}
+
+#[derive(Serialize)]
+struct SessionHitsDto {
+    session_id: String,
+    title: String,
+    space_id: Option<String>,
+    updated_at_ms: u64,
+    hits: Vec<SearchHitDto>,
+}
+
+impl From<SessionHits> for SessionHitsDto {
+    fn from(group: SessionHits) -> Self {
+        Self {
+            session_id: group.session_id,
+            title: group.title,
+            space_id: group.space_id,
+            updated_at_ms: group.updated_at_ms,
+            hits: group
+                .hits
+                .into_iter()
+                .map(|hit| SearchHitDto {
+                    msg: hit.msg,
+                    block: hit.block,
+                    role: hit.role,
+                    snippet: hit.snippet,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -67,6 +172,12 @@ struct ModeList {
     all: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct DeleteReport {
+    /// 搬回「任务」的会话数。
+    moved: usize,
+}
+
 /// 发一句话，等这一轮跑完。
 ///
 /// 过程不靠返回值传递，全靠事件。返回值只说明"为什么结束"。
@@ -77,13 +188,26 @@ async fn chat(
     prompt: String,
 ) -> Result<ChatReport, String> {
     let service = Arc::clone(state.inner().service());
+
+    // 事件信封需要会话 id，而 id 本来是"第一次落盘时才生成"。
+    // 这里提前把 id 定下来（**不建文件**），整轮的事件才有一个稳定归属；
+    // 否则前几个 delta 的 session_id 是 null，前端没法用同一个键过滤。
+    let session_id = service.ensure_session_id();
+
     let (sink, mut rx) = EventSink::channel();
 
-    // 事件泵：把 mpsc 收到的东西原样转成前端能 listen 的事件。
+    // 事件泵：把 mpsc 收到的东西包成 envelope 再发给前端。
     let emitter = app.clone();
     let pump = tauri::async_runtime::spawn(async move {
+        let mut seq = 0u64;
         while let Some(event) = rx.recv().await {
-            let _ = emitter.emit(EVENT_CHANNEL, &event);
+            let envelope = EventEnvelope {
+                session_id: session_id.clone(),
+                seq,
+                event,
+            };
+            seq += 1;
+            let _ = emitter.emit(EVENT_CHANNEL, &envelope);
         }
     });
 
@@ -119,11 +243,13 @@ async fn snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
         provider: service.provider_id().to_string(),
         model: service.model(),
         workspace: service.workspace().display().to_string(),
+        active_space_id: service.active_space(),
         messages: service.message_count().await,
         pending_permissions: service.pending_permissions(),
         session_id: service.current_session(),
         provider_reason: provider_state.reason().map(str::to_string),
         provider_state: provider_state.as_str().to_string(),
+        spaces_warning: service.spaces_warning(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }
@@ -160,19 +286,19 @@ async fn history(state: State<'_, AppState>) -> Result<Vec<Message>, String> {
     Ok(service.history().await)
 }
 
+/// 会话列表。`space_id` 缺省 = 全部空间；`include_archived` 缺省 = 不含归档。
 #[tauri::command]
-async fn list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionDto>, String> {
+async fn list_sessions(
+    state: State<'_, AppState>,
+    space_id: Option<String>,
+    include_archived: Option<bool>,
+) -> Result<Vec<SessionDto>, String> {
     let service = Arc::clone(state.inner().service());
-    let sessions = service.list_sessions().await.map_err(|e| e.to_string())?;
-    Ok(sessions
-        .into_iter()
-        .map(|s| SessionDto {
-            id: s.id,
-            title: s.title,
-            messages: s.messages,
-            updated_at_ms: s.updated_at_ms,
-        })
-        .collect())
+    let sessions = service
+        .list_sessions(space_id.as_deref(), include_archived.unwrap_or(false))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(sessions.into_iter().map(SessionDto::from).collect())
 }
 
 /// 打开历史会话并把它整段历史交回前端。前端拿到就能直接渲染，不必再调 `history`。
@@ -183,10 +309,14 @@ async fn open_session(state: State<'_, AppState>, id: String) -> Result<Vec<Mess
     Ok(service.history().await)
 }
 
+/// 新建会话。`space_id` 缺省 = 「任务」。
 #[tauri::command]
-async fn new_session(state: State<'_, AppState>) -> Result<(), String> {
+async fn new_session(
+    state: State<'_, AppState>,
+    space_id: Option<String>,
+) -> Result<(), String> {
     let service = Arc::clone(state.inner().service());
-    service.new_session().await;
+    service.new_session_in(space_id.as_deref()).await;
     Ok(())
 }
 
@@ -203,6 +333,7 @@ async fn rename_session(
         .map_err(|e| e.to_string())
 }
 
+/// **永久删除**。会话菜单里没有它，只在归档区作为「这条真不要了」暴露。
 #[tauri::command]
 async fn delete_session(state: State<'_, AppState>, id: String) -> Result<bool, String> {
     let service = Arc::clone(state.inner().service());
@@ -210,6 +341,124 @@ async fn delete_session(state: State<'_, AppState>, id: String) -> Result<bool, 
         .delete_session(&id)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn spaces(state: State<'_, AppState>) -> Result<Vec<SpaceDto>, String> {
+    let service = Arc::clone(state.inner().service());
+    Ok(service
+        .spaces()
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(SpaceDto::from)
+        .collect())
+}
+
+#[tauri::command]
+async fn create_space(
+    state: State<'_, AppState>,
+    name: String,
+    path: String,
+) -> Result<SpaceDto, String> {
+    let service = Arc::clone(state.inner().service());
+    service
+        .create_space(&name, std::path::Path::new(&path))
+        .await
+        .map(SpaceDto::from)
+        .map_err(|e| e.to_string())
+}
+
+/// 改名 / 换目录。两项都可缺省，只传要改的那个。
+#[tauri::command]
+async fn update_space(
+    state: State<'_, AppState>,
+    id: String,
+    name: Option<String>,
+    path: Option<String>,
+) -> Result<SpaceDto, String> {
+    let service = Arc::clone(state.inner().service());
+    let path = path.as_deref().map(std::path::Path::new);
+    service
+        .update_space(&id, name.as_deref(), path)
+        .await
+        .map(SpaceDto::from)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_space(state: State<'_, AppState>, id: String) -> Result<DeleteReport, String> {
+    let service = Arc::clone(state.inner().service());
+    let moved = service.delete_space(&id).await.map_err(|e| e.to_string())?;
+    Ok(DeleteReport { moved })
+}
+
+#[tauri::command]
+async fn pin_session(
+    state: State<'_, AppState>,
+    id: String,
+    pinned: bool,
+) -> Result<bool, String> {
+    let service = Arc::clone(state.inner().service());
+    service
+        .pin_session(&id, pinned)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn archive_session(
+    state: State<'_, AppState>,
+    id: String,
+    archived: bool,
+) -> Result<bool, String> {
+    let service = Arc::clone(state.inner().service());
+    service
+        .archive_session(&id, archived)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn search_sessions(
+    state: State<'_, AppState>,
+    query: String,
+    include_archived: Option<bool>,
+) -> Result<Vec<SessionHitsDto>, String> {
+    let service = Arc::clone(state.inner().service());
+    Ok(service
+        .search_sessions(&query, include_archived.unwrap_or(false))
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(SessionHitsDto::from)
+        .collect())
+}
+
+/// 打开会话所属的工作目录。
+///
+/// 入参是 id 不是路径：路径由 app 层算。这样即使前端被注入，
+/// 也没法让后端打开 `C:\Windows`——它只能打开「这条会话所在的目录」。
+#[tauri::command]
+async fn reveal_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<String, String> {
+    let service = Arc::clone(state.inner().service());
+    let path = service
+        .reveal_session(&id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let display = path.display().to_string();
+
+    // 目录可能还没建（默认工作区首次启动）。先建再开，
+    // 否则资源管理器会直接弹「找不到这个项目」。
+    let _ = std::fs::create_dir_all(&path);
+    app.opener()
+        .open_path(display.clone(), None::<&str>)
+        .map_err(|e| format!("打开 {} 失败: {e}", display))?;
+    Ok(display)
 }
 
 #[derive(Serialize)]
@@ -362,7 +611,7 @@ fn resolve_workspace() -> std::path::PathBuf {
     goldenagent_app::resolve_workspace(&cwd).0
 }
 
-/// 装配 + 启动时的两件小事：收编旧版单文件会话、接上次没聊完的那条。
+/// 装配 + 启动时的三件小事：备好空间存储、收编旧版单文件会话、接上次没聊完的那条。
 ///
 /// 放在启动里同步做完，是为了让前端挂载时拿到的 `snapshot` 就已经是"续跑后"的状态；
 /// 如果改成后台任务，首屏会先闪一下空会话再跳变成历史。
@@ -373,14 +622,19 @@ fn build_service(workspace: &std::path::Path) -> AgentService {
     let _ = std::fs::create_dir_all(workspace);
 
     let state_dir = workspace.join(".goldenagent");
-    let config = AgentConfig::new(workspace).with_session_dir(state_dir.join("sessions"));
+    let config = AgentConfig::new(workspace).with_state_dir(&state_dir);
 
     // provider：环境变量 → .goldenagent/provider.json → 离线回显。
     // 装配失败不 panic，降级原因会随 snapshot 回到界面。
     let service = AgentService::auto(config, &state_dir.join("provider.json"));
 
     let _ = tauri::async_runtime::block_on(async {
-        service.adopt_legacy(state_dir.join("session.jsonl")).await?;
+        // 先备好清单与目录（含旧布局迁移），再收编 B10 的单文件会话，
+        // 最后接上次——顺序错了 restore 会看不到刚收编进来的历史。
+        if let Ok(Some(warning)) = service.bootstrap().await {
+            eprintln!("[spaces] {warning}");
+        }
+        let _ = service.adopt_legacy(state_dir.join("session.jsonl")).await;
         service.restore().await
     });
 
@@ -397,6 +651,9 @@ pub fn run() {
     };
 
     tauri::Builder::default()
+        // 只用 Rust 侧的 `open_path`（见 reveal_session）。前端**没有**被授予
+        // opener 的 command 权限，所以它没法自己让系统打开任意路径。
+        .plugin(tauri_plugin_opener::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             chat,
@@ -411,6 +668,14 @@ pub fn run() {
             new_session,
             rename_session,
             delete_session,
+            spaces,
+            create_space,
+            update_space,
+            delete_space,
+            pin_session,
+            archive_session,
+            search_sessions,
+            reveal_session,
             provider_setup,
             save_provider,
             app_info

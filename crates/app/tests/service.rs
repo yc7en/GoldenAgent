@@ -241,7 +241,7 @@ async fn session_persists_across_service_instances() {
     let (sink, _rx) = EventSink::channel();
     first.chat("第一句", &sink).await.unwrap();
 
-    let listed = first.list_sessions().await.unwrap();
+    let listed = first.list_sessions(None, false).await.unwrap();
     assert_eq!(listed.len(), 1, "聊过一次就该有一条会话");
     assert_eq!(listed[0].messages, 2);
 
@@ -267,7 +267,7 @@ async fn new_session_leaves_no_empty_files() {
 
     service.new_session().await;
     assert!(service.current_session().is_none());
-    assert!(service.list_sessions().await.unwrap().is_empty());
+    assert!(service.list_sessions(None, false).await.unwrap().is_empty());
 
     let (sink, _rx) = EventSink::channel();
     service.chat("你好", &sink).await.unwrap();
@@ -275,8 +275,8 @@ async fn new_session_leaves_no_empty_files() {
     let id = service.current_session().expect("聊过之后要有 id");
     service.new_session().await;
     assert!(service.current_session().is_none());
-    assert_eq!(service.list_sessions().await.unwrap().len(), 1);
-    assert_eq!(service.list_sessions().await.unwrap()[0].id, id);
+    assert_eq!(service.list_sessions(None, false).await.unwrap().len(), 1);
+    assert_eq!(service.list_sessions(None, false).await.unwrap()[0].id, id);
 }
 
 /// 打开 / 改名 / 删除一整圈。
@@ -299,7 +299,7 @@ async fn session_lifecycle_roundtrip() {
     assert_ne!(first_id, second_id);
 
     // 列表里有两条，标题都是各自的第一句
-    let listed = service.list_sessions().await.unwrap();
+    let listed = service.list_sessions(None, false).await.unwrap();
     assert_eq!(listed.len(), 2);
     let titles: Vec<_> = listed.iter().map(|s| s.title.as_str()).collect();
     assert!(titles.contains(&"第一次提问"), "{titles:?}");
@@ -315,7 +315,7 @@ async fn session_lifecycle_roundtrip() {
         "改过的名字"
     );
     assert!(service
-        .list_sessions()
+        .list_sessions(None, false)
         .await
         .unwrap()
         .iter()
@@ -325,7 +325,7 @@ async fn session_lifecycle_roundtrip() {
     assert!(service.delete_session(&first_id).await.unwrap());
     assert!(service.current_session().is_none());
     assert_eq!(service.message_count().await, 0);
-    assert_eq!(service.list_sessions().await.unwrap().len(), 1);
+    assert_eq!(service.list_sessions(None, false).await.unwrap().len(), 1);
 }
 
 /// 没配会话目录时，历史相关动作要明确报错，而不是假装成功。
@@ -337,7 +337,7 @@ async fn history_actions_require_session_dir() {
         Arc::new(MockProvider::default()),
     );
 
-    let error = service.list_sessions().await.unwrap_err();
+    let error = service.list_sessions(None, false).await.unwrap_err();
     assert!(error.to_string().contains("会话目录"), "{error}");
     assert!(service.restore().await.is_err());
 }

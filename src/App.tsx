@@ -1,241 +1,138 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 
+import { api } from "./api";
 import {
-  type AgentEvent,
-  type AppInfo,
-  type ChatReport,
-  type Message,
-  type ProviderSetup,
-  type SessionSummary,
-  type Snapshot,
-  MODE_LABELS,
-  PROVIDER_LABELS,
-  STOP_LABELS,
+  applyEvent,
+  entriesFromMessages,
+  indexOfSource,
+  searchEntries,
+  type Entry,
+} from "./lib/entries";
+import type {
+  AgentEvent,
+  AppInfo,
+  EventEnvelope,
+  ProviderSetup,
+  SearchHit,
+  SessionHits,
+  SessionSummary,
+  Snapshot,
+  SpaceInfo,
 } from "./types";
+import { MODE_LABELS, STOP_LABELS } from "./types";
+
+import Topbar from "./components/Topbar";
+import Sidebar from "./components/Sidebar";
+import ChatHead from "./components/ChatHead";
+import Transcript from "./components/Transcript";
+import Composer from "./components/Composer";
+import EventsPanel from "./components/EventsPanel";
+import SettingsSheet from "./components/SettingsSheet";
+import SessionMenu, { type MenuTarget } from "./components/SessionMenu";
+import SpaceDialog from "./components/SpaceDialog";
+import GlobalSearch from "./components/GlobalSearch";
+import SessionSearch from "./components/SessionSearch";
 
 const EVENT_CHANNEL = "agent://event";
 
-/** 工作区是怎么定下来的。用户觉得"看到的文件不对"时，先看这个。 */
-const WORKSPACE_LABELS: Record<string, string> = {
-  env: "环境变量指定",
-  cwd: "当前目录",
-  home: "家目录默认",
-};
+const PREF = {
+  sideWidth: "ga.sideWidth",
+  sideCollapsed: "ga.sideCollapsed",
+  eventsOpen: "ga.eventsOpen",
+} as const;
 
-type Entry =
-  | { kind: "user"; text: string }
-  | { kind: "assistant"; text: string }
-  /**
-   * 推理模型的思考过程。
-   *
-   * 它是**临时展示**：不落盘、不进历史，所以只在本次运行的事件流里出现。
-   * 单独一种条目而不是拼进 assistant，是因为它不该和回答长得一样——
-   * 用户需要知道哪句是它想过的，哪句是它说的。
-   */
-  | { kind: "thinking"; text: string }
-  | { kind: "notice"; level: "info" | "error"; text: string }
-  | {
-      kind: "tool";
-      id: string;
-      name: string;
-      input: unknown;
-      status: "running" | "ok" | "failed";
-      output?: string;
-    };
-
-/**
- * 把一个事件折叠进对话列表。
- *
- * 前端**不判断业务**：它只是把事件画出来。
- * 这里唯一有点像"逻辑"的动作是"把连续的 text_delta 拼成一段"，
- * 那纯粹是渲染需要，不改变任何语义。
- */
-function applyEvent(entries: Entry[], event: AgentEvent): Entry[] {
-  switch (event.type) {
-    case "text_delta": {
-      const last = entries.at(-1);
-      if (last?.kind === "assistant") {
-        return [
-          ...entries.slice(0, -1),
-          { kind: "assistant", text: last.text + event.text },
-        ];
-      }
-      return [...entries, { kind: "assistant", text: event.text }];
-    }
-
-    case "thinking_delta": {
-      // 连续的思考片段并成一块，和 text_delta 一样只是为了渲染。
-      const last = entries.at(-1);
-      if (last?.kind === "thinking") {
-        return [
-          ...entries.slice(0, -1),
-          { kind: "thinking", text: last.text + event.text },
-        ];
-      }
-      return [...entries, { kind: "thinking", text: event.text }];
-    }
-
-    case "tool_started":
-      return [
-        ...entries,
-        {
-          kind: "tool",
-          id: event.id,
-          name: event.name,
-          input: event.input,
-          status: "running",
-        },
-      ];
-
-    case "tool_finished":
-      return entries.map((entry) =>
-        entry.kind === "tool" && entry.id === event.id
-          ? { ...entry, status: event.ok ? "ok" : "failed", output: event.output }
-          : entry,
-      );
-
-    case "turn_started":
-      // 第一轮不提示，否则每次对话都多一条噪音
-      return event.turn > 1
-        ? [
-            ...entries,
-            { kind: "notice", level: "info", text: `第 ${event.turn} 轮` },
-          ]
-        : entries;
-
-    case "context_compacted":
-      return [
-        ...entries,
-        {
-          kind: "notice",
-          level: "info",
-          text: `上下文已压缩，移除 ${event.removed} 条历史`,
-        },
-      ];
-
-    case "finished":
-      return [
-        ...entries,
-        {
-          kind: "notice",
-          level: "info",
-          text: `本轮结束：${STOP_LABELS[event.reason] ?? event.reason}`,
-        },
-      ];
-
-    case "error":
-      return [...entries, { kind: "notice", level: "error", text: event.message }];
-
-    // permission_requested 单独用横幅展示，不进对话流
-    default:
-      return entries;
+function readPref(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
   }
 }
 
-/**
- * 把落盘的历史折成对话条目。
- *
- * 和 `applyEvent` 是同一件事的两个方向：那边是"事件流 → 条目"，
- * 这边是"已存的消息 → 条目"。工具卡片靠 `tool_call` / `tool_result` 的 id 配对，
- * 所以打开旧会话时能看到当时调用了什么、结果如何，而不是只剩文字。
- */
-function entriesFromMessages(messages: Message[]): Entry[] {
-  const entries: Entry[] = [];
-  const slots = new Map<string, number>();
-
-  for (const message of messages) {
-    for (const block of message.blocks) {
-      if (block.type === "text") {
-        entries.push(
-          message.role === "user"
-            ? { kind: "user", text: block.text }
-            : { kind: "assistant", text: block.text },
-        );
-      } else if (block.type === "tool_call") {
-        slots.set(block.id, entries.length);
-        entries.push({
-          kind: "tool",
-          id: block.id,
-          name: block.name,
-          input: block.input,
-          status: "running",
-        });
-      } else {
-        const slot = slots.get(block.id);
-        if (slot === undefined) continue;
-        const target = entries[slot];
-        if (!target || target.kind !== "tool") continue;
-        entries[slot] = {
-          ...target,
-          status: block.ok ? "ok" : "failed",
-          output: block.output,
-        };
-      }
-    }
+function writePref(key: string, value: string): void {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // 隐私模式下 localStorage 可能直接抛错。偏好丢了不影响使用。
   }
-
-  return entries;
 }
 
-/** 侧栏里的时间只需要"多久以前"，精确到分钟就够了。 */
-function relativeTime(ms: number): string {
-  const diff = Date.now() - ms;
-  if (diff < 0) return "刚刚";
-  if (diff < 60_000) return "刚刚";
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
-  const date = new Date(ms);
-  return `${date.getMonth() + 1}月${date.getDate()}日`;
+/** 侧栏宽度：180–460，且不超过窗口的 52%。 */
+function clampWidth(width: number): number {
+  const max = Math.min(460, Math.floor(window.innerWidth * 0.52));
+  if (!Number.isFinite(width)) return 244;
+  return Math.max(180, Math.min(max, Math.round(width)));
 }
 
 export default function App() {
+  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [spaces, setSpaces] = useState<SpaceInfo[]>([]);
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
   const [entries, setEntries] = useState<Entry[]>([]);
-  const [log, setLog] = useState<AgentEvent[]>([]);
+  const [events, setEvents] = useState<EventEnvelope[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [modes, setModes] = useState<string[]>([]);
   const [permission, setPermission] = useState<{
     id: string;
     name: string;
     summary: string;
   } | null>(null);
-  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
-  const [modes, setModes] = useState<string[]>([]);
-  const [showLog, setShowLog] = useState(false);
 
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
+  const [sideCollapsed, setSideCollapsed] = useState(() => readPref(PREF.sideCollapsed) === "1");
+  const [sideWidth, setSideWidth] = useState(() => clampWidth(Number(readPref(PREF.sideWidth) ?? 244)));
+  const [eventsOpen, setEventsOpen] = useState(() => readPref(PREF.eventsOpen) === "1");
+  const [archivedOpen, setArchivedOpen] = useState(false);
+
+  const [menu, setMenu] = useState<{ target: MenuTarget; at: { x: number; y: number } } | null>(null);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<SessionHits[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+
+  const [sessionSearchOpen, setSessionSearchOpen] = useState(false);
+  const [sessionQuery, setSessionQuery] = useState("");
+
+  const [spaceDialog, setSpaceDialog] = useState<
+    { mode: "create" } | { mode: "edit"; space: SpaceInfo } | null
+  >(null);
+  const [deleteTarget, setDeleteTarget] = useState<SessionSummary | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
-  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [setup, setSetup] = useState<ProviderSetup | null>(null);
   const [info, setInfo] = useState<AppInfo | null>(null);
-  const [showSettings, setShowSettings] = useState(false);
-  const [form, setForm] = useState({
-    kind: "anthropic",
-    model: "",
-    api_key: "",
-    base_url: "",
-    // 用字符串存：输入框清空时不能立刻变成 0，那会被后端夹成最小值。
-    max_tokens: "",
-  });
-  const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
 
-  const transcriptRef = useRef<HTMLDivElement>(null);
+  const [flash, setFlash] = useState<{ index: number; token: number } | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+
   const busyRef = useRef(false);
+  const activeIdRef = useRef<string | null>(null);
   const renameGuard = useRef<string | null>(null);
   busyRef.current = busy;
+  activeIdRef.current = activeId;
+
+  const notify = useCallback((text: string) => {
+    setToast(text);
+    window.setTimeout(() => setToast((current) => (current === text ? null : current)), 2600);
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
-      const next = await invoke<Snapshot>("snapshot");
+      const next = await api.snapshot();
       setSnapshot(next);
       setActiveId(next.session_id);
-      setSessions(await invoke<SessionSummary[]>("list_sessions"));
+      const [spaceList, sessionList] = await Promise.all([
+        api.spaces(),
+        // 一次取回全部（含归档）：侧栏是一棵树，取两次会出现半棵树。
+        api.listSessions(null, true),
+      ]);
+      setSpaces(spaceList);
+      setSessions(sessionList);
     } catch (error) {
       console.error("读取状态失败", error);
     }
@@ -245,51 +142,47 @@ export default function App() {
     let unlisten: (() => void) | undefined;
     let disposed = false;
 
-    void listen<AgentEvent>(EVENT_CHANNEL, (message) => {
-      const event = message.payload;
-      setLog((prev) => [...prev.slice(-199), event]);
+    void listen<EventEnvelope>(EVENT_CHANNEL, (message) => {
+      const envelope = message.payload;
+      setEvents((prev) => [...prev.slice(-199), envelope]);
+
+      // 只认当前会话的帧。信封就是为这件事存在的：
+      // 以前靠「busy 时禁止切会话」保证不串台，那是 UI 约束，不是系统约束。
+      if (envelope.session_id && activeIdRef.current && envelope.session_id !== activeIdRef.current) {
+        return;
+      }
+
+      const event = envelope.event as AgentEvent;
       setEntries((prev) => applyEvent(prev, event));
 
       if (event.type === "permission_requested") {
-        setPermission({
-          id: event.id,
-          name: event.name,
-          summary: event.summary,
-        });
+        setPermission({ id: event.id, name: event.name, summary: event.summary });
       }
       if (event.type === "finished" || event.type === "error") {
         setPermission(null);
       }
     }).then((fn) => {
-      if (disposed) {
-        fn();
-      } else {
-        unlisten = fn;
-      }
+      if (disposed) fn();
+      else unlisten = fn;
     });
 
-    void invoke<{ current: string; all: string[] }>("modes").then((result) =>
-      setModes(result.all),
-    );
-
-    // 配置面板的数据只在挂载时取一次：它不会因为对话而变，
-    // 变了只有一个原因——用户在面板里保存了，那时会主动重新取。
-    void invoke<ProviderSetup>("provider_setup").then((result) => {
+    void api.modes().then((result) => {
+      if (!disposed) setModes(result.all);
+    });
+    void api.providerSetup().then((result) => {
       if (!disposed) setSetup(result);
     });
-    void invoke<AppInfo>("app_info").then((result) => {
+    void api.appInfo().then((result) => {
       if (!disposed) setInfo(result);
     });
 
     // 首屏回填：后端启动时已经打开了最近一条会话，这里要把它的历史画出来，
-    // 否则会出现"顶栏说 12 条消息、对话区却是空的"。
+    // 否则会出现「顶栏说 12 条消息、对话区却是空的」。
     void (async () => {
       await refresh();
       try {
-        const history = await invoke<Message[]>("history");
-        if (!disposed && history.length > 0) {
-          setEntries(entriesFromMessages(history));
-        }
+        const history = await api.history();
+        if (!disposed && history.length > 0) setEntries(entriesFromMessages(history));
       } catch (error) {
         console.error("读取历史失败", error);
       }
@@ -301,101 +194,120 @@ export default function App() {
     };
   }, [refresh]);
 
+  // 纯 UI 偏好留在这台机器这个窗口，不进后端配置——它们不是项目属性。
+  useEffect(() => writePref(PREF.sideWidth, String(sideWidth)), [sideWidth]);
+  useEffect(() => writePref(PREF.sideCollapsed, sideCollapsed ? "1" : "0"), [sideCollapsed]);
+  useEffect(() => writePref(PREF.eventsOpen, eventsOpen ? "1" : "0"), [eventsOpen]);
+
+  // 全局搜索：150ms debounce。每次敲键都扫盘会让首屏发抖。
   useEffect(() => {
-    const node = transcriptRef.current;
-    if (node) {
-      node.scrollTop = node.scrollHeight;
-    }
-  }, [entries]);
-
-  // 改名时提交一次就够：回车会先触发提交，紧接着的 blur 不该再写一遍。
-  function startRename(session: SessionSummary) {
-    renameGuard.current = session.id;
-    setRenaming(session.id);
-    setRenameDraft(session.title);
-    setConfirmDelete(null);
-  }
-
-  async function commitRename() {
-    const id = renameGuard.current;
-    if (!id) return;
-    renameGuard.current = null;
-
-    const title = renameDraft.trim();
-    setRenaming(null);
-
-    // 没改或者清空了就当取消——空标题后端也会拒，没必要让它跑一趟再报错。
-    if (title.length === 0) return;
-
-    try {
-      await invoke<string>("rename_session", { id, title });
-    } catch (error) {
-      setEntries((prev) => [
-        ...prev,
-        { kind: "notice", level: "error", text: String(error) },
-      ]);
-    } finally {
-      void refresh();
-    }
-  }
-
-  function cancelRename() {
-    renameGuard.current = null;
-    setRenaming(null);
-  }
-
-  async function openSession(id: string) {
-    if (busyRef.current || id === activeId) return;
-    try {
-      const history = await invoke<Message[]>("open_session", { id });
-      setEntries(entriesFromMessages(history));
-      setLog([]);
-      setActiveId(id);
-      void refresh();
-    } catch (error) {
-      setEntries((prev) => [
-        ...prev,
-        { kind: "notice", level: "error", text: String(error) },
-      ]);
-    }
-  }
-
-  async function newSession() {
-    if (busyRef.current) return;
-    await invoke("new_session");
-    setEntries([]);
-    setLog([]);
-    setActiveId(null);
-    setConfirmDelete(null);
-    void refresh();
-  }
-
-  async function removeSession(id: string) {
-    try {
-      await invoke<boolean>("delete_session", { id });
-    } catch (error) {
-      setEntries((prev) => [
-        ...prev,
-        { kind: "notice", level: "error", text: String(error) },
-      ]);
-    } finally {
-      setConfirmDelete(null);
-      void refresh();
-    }
-  }
-
-  async function send() {
-    const prompt = input.trim();
-    if (!prompt || busyRef.current) {
+    if (!searchOpen) return;
+    const query = searchQuery.trim();
+    if (!query) {
+      setSearchResults([]);
+      setSearchError(null);
+      setSearchLoading(false);
       return;
     }
+    setSearchLoading(true);
+    const timer = window.setTimeout(() => {
+      void api
+        .searchSessions(query, false)
+        .then((result) => {
+          setSearchResults(result);
+          setSearchError(null);
+        })
+        .catch((error: unknown) => {
+          setSearchResults([]);
+          setSearchError(error instanceof Error ? error.message : String(error));
+        })
+        .finally(() => setSearchLoading(false));
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [searchQuery, searchOpen]);
+
+  // 快捷键：Ctrl/Cmd+B 收侧栏，Ctrl/Cmd+K 全局搜索。
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey)) return;
+      const key = event.key.toLowerCase();
+      if (key === "b") {
+        event.preventDefault();
+        setSideCollapsed((value) => !value);
+      }
+      if (key === "k") {
+        event.preventDefault();
+        setSearchQuery("");
+        setSearchOpen(true);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  useEffect(() => {
+    if (!flash) return;
+    const timer = window.setTimeout(() => setFlash(null), 2200);
+    return () => window.clearTimeout(timer);
+  }, [flash]);
+
+  const sessionSearchHits = useMemo(
+    () => (sessionQuery.trim() ? searchEntries(entries, sessionQuery) : []),
+    [entries, sessionQuery],
+  );
+
+  const activeSession = sessions.find((session) => session.id === activeId) ?? null;
+  const activeSpaceName =
+    spaces.find((space) => space.id === snapshot?.active_space_id)?.name ?? "任务";
+  const modeLabel = MODE_LABELS[snapshot?.mode ?? ""] ?? snapshot?.mode ?? "…";
+
+  // ───────────────────────── 会话动作 ─────────────────────────
+
+  async function openSession(id: string, jump?: SearchHit): Promise<void> {
+    if (busyRef.current || id === activeId) return;
+    try {
+      const history = await api.openSession(id);
+      const next = entriesFromMessages(history);
+      setEntries(next);
+      setEvents([]);
+      setActiveId(id);
+      setSessionSearchOpen(false);
+      setSessionQuery("");
+      if (jump) {
+        const index = indexOfSource(next, { msg: jump.msg, block: jump.block });
+        if (index >= 0) setFlash({ index, token: Date.now() });
+      }
+      await refresh();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function newSession(spaceId: string | null): Promise<void> {
+    if (busyRef.current) return;
+    try {
+      await api.newSession(spaceId);
+      setEntries([]);
+      setEvents([]);
+      setActiveId(null);
+      setSessionSearchOpen(false);
+      setSessionQuery("");
+      await refresh();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function send(): Promise<void> {
+    const prompt = input.trim();
+    if (!prompt || busyRef.current) return;
 
     setInput("");
     setEntries((prev) => [...prev, { kind: "user", text: prompt }]);
     setBusy(true);
 
     try {
-      const report = await invoke<ChatReport>("chat", { prompt });
+      const report = await api.chat(prompt);
       if (report.outcome !== "completed") {
         setEntries((prev) => [
           ...prev,
@@ -414,388 +326,264 @@ export default function App() {
     } finally {
       setBusy(false);
       setPermission(null);
-      void refresh();
+      await refresh();
     }
   }
 
-  async function answerPermission(allowed: boolean) {
-    if (!permission) {
-      return;
-    }
+  async function answerPermission(allowed: boolean): Promise<void> {
+    if (!permission) return;
     try {
-      await invoke<boolean>("resolve_permission", {
-        id: permission.id,
-        allowed,
-      });
+      await api.resolvePermission(permission.id, allowed);
     } finally {
       setPermission(null);
     }
   }
 
-  async function changeMode(mode: string) {
+  async function pin(session: SessionSummary, pinned: boolean): Promise<void> {
+    // 乐观更新：只写一个零字节标记，失败的概率低到不值得等一个来回。
+    setSessions((prev) =>
+      prev.map((item) => (item.id === session.id ? { ...item, pinned } : item)),
+    );
     try {
-      await invoke<string>("set_mode", { mode });
-    } finally {
-      void refresh();
-    }
-  }
-
-  /** 打开面板时用当前配置预填，但不填 key：后端根本不会把它发下来。 */
-  function openSettings() {
-    if (setup) {
-      setForm({
-        kind: setup.kind,
-        model: setup.model,
-        api_key: "",
-        base_url: setup.base_url,
-        max_tokens: String(setup.max_tokens),
-      });
-    }
-    setSaveError(null);
-    setShowSettings(true);
-  }
-
-  async function saveProvider() {
-    if (saving) return;
-    setSaving(true);
-    setSaveError(null);
-
-    try {
-      const next = await invoke<ProviderSetup>("save_provider", {
-        input: {
-          kind: form.kind,
-          model: form.model.trim(),
-          // 空串表达"没改 key"。后端据此保留原来那份——
-          // 界面从来拿不到旧 key，所以不能用"回填再提交"的办法。
-          api_key: form.api_key.length > 0 ? form.api_key : null,
-          base_url: form.base_url.trim(),
-          // 空框 = 不改。填了非数字也当"不改"，别把一个 NaN 发给后端。
-          max_tokens:
-            form.max_tokens.trim().length > 0 &&
-            Number.isFinite(Number(form.max_tokens))
-              ? Number(form.max_tokens)
-              : null,
-        },
-      });
-      setSetup(next);
-      setShowSettings(false);
-      void refresh();
+      await api.pinSession(session.id, pinned);
     } catch (error) {
-      setSaveError(String(error));
-    } finally {
-      setSaving(false);
+      setSessions((prev) =>
+        prev.map((item) => (item.id === session.id ? { ...item, pinned: !pinned } : item)),
+      );
+      notify(error instanceof Error ? error.message : String(error));
     }
   }
 
-  async function copyTemplate() {
-    if (!setup) return;
+  async function archive(session: SessionSummary, archived: boolean): Promise<void> {
+    setSessions((prev) =>
+      prev.map((item) => (item.id === session.id ? { ...item, archived } : item)),
+    );
     try {
-      await navigator.clipboard.writeText(setup.template);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // 剪贴板被拒时不要静默：用户会以为复制成功了。
-      setSaveError("复制失败，请展开下面的模板手动选择");
+      await api.archiveSession(session.id, archived);
+      if (archived && session.id === activeId) {
+        setEntries([]);
+        setEvents([]);
+        setActiveId(null);
+      }
+      await refresh();
+    } catch (error) {
+      setSessions((prev) =>
+        prev.map((item) => (item.id === session.id ? { ...item, archived: !archived } : item)),
+      );
+      notify(error instanceof Error ? error.message : String(error));
     }
   }
 
-  const modeLabel = MODE_LABELS[snapshot?.mode ?? ""] ?? snapshot?.mode ?? "…";
+  async function reveal(session: SessionSummary): Promise<void> {
+    try {
+      const path = await api.revealSession(session.id);
+      notify(`已打开 ${path}`);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : String(error));
+    }
+  }
 
-  // 顶栏这句话要能一眼区分三件事：没配、配错、配好了。
-  // 全说成"离线回显"的话，用户不知道该去配还是该去修。
-  const providerState = snapshot?.provider_state ?? "unconfigured";
-  const providerLabel = !snapshot
-    ? "…"
-    : providerState === "unconfigured"
-      ? "未配置模型"
-      : providerState === "degraded"
-        ? "配置有问题"
-        : snapshot.provider === "mock"
-          ? "离线回显"
-          : `${PROVIDER_LABELS[snapshot.provider] ?? snapshot.provider} · ${snapshot.model}`;
+  async function deleteForever(): Promise<void> {
+    if (!deleteTarget) return;
+    try {
+      await api.deleteSession(deleteTarget.id);
+      if (deleteTarget.id === activeId) {
+        setEntries([]);
+        setEvents([]);
+        setActiveId(null);
+      }
+      await refresh();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDeleteTarget(null);
+    }
+  }
 
-  // 表单里这几处提示都从后端下发的 catalog 推出来，不另抄一份默认模型名。
-  const currentOption = setup?.catalog.find((option) => option.id === form.kind);
-  const keyPlaceholder =
-    setup?.kind === form.kind && providerState === "ready"
-      ? "留空表示不修改已保存的 Key"
-      : currentOption?.needs_key === false
-        ? "这一项不需要 Key"
-        : "必填";
+  function startRename(session: SessionSummary): void {
+    renameGuard.current = session.id;
+    setRenaming(session.id);
+    setRenameDraft(session.title);
+  }
+
+  async function commitRename(): Promise<void> {
+    const id = renameGuard.current;
+    if (!id) return;
+    renameGuard.current = null;
+    const title = renameDraft.trim();
+    setRenaming(null);
+    // 没改或者清空了就当取消——空标题后端也会拒。
+    if (!title) return;
+    try {
+      await api.renameSession(id, title);
+      await refresh();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function cancelRename(): void {
+    renameGuard.current = null;
+    setRenaming(null);
+  }
+
+  // ───────────────────────── 壳层交互 ─────────────────────────
+
+  function startResize(event: React.PointerEvent): void {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = sideWidth;
+    document.body.classList.add("resizing");
+
+    const onMove = (moveEvent: PointerEvent) => {
+      setSideWidth(clampWidth(startWidth + moveEvent.clientX - startX));
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      document.body.classList.remove("resizing");
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  function pickSearchHit(sessionId: string, hit: SearchHit): void {
+    setSearchOpen(false);
+    void openSession(sessionId, hit);
+  }
+
+  const empty = (
+    <>
+      {snapshot?.provider_state === "unconfigured" ? (
+        <>
+          <p>还没接模型。</p>
+          <p className="empty-hint">
+            现在跑的是离线回显：你说什么它就把话回给你，工具与权限流程都能试。
+            填一个 API Key 就能接真模型——配置只存在本机，不会上传到任何地方。
+          </p>
+          <button type="button" className="primary" onClick={() => setSettingsOpen(true)}>
+            配置模型
+          </button>
+          {setup && <p className="empty-path">也可以自己编辑：{setup.config_path}</p>}
+        </>
+      ) : snapshot?.provider_state === "degraded" ? (
+        <>
+          <p>模型配置有问题，暂时退回离线回显。</p>
+          <p className="empty-warn">{snapshot.provider_reason}</p>
+          <button type="button" className="primary" onClick={() => setSettingsOpen(true)}>
+            去修配置
+          </button>
+        </>
+      ) : (
+        <>
+          <p>说点什么。</p>
+          <p className="empty-hint">
+            {snapshot?.provider === "mock"
+              ? "当前显式配置为离线回显，它会把你的话原样回给你，工具照常可用。"
+              : `已接入 ${snapshot?.model ?? ""}，可以读写「${activeSpaceName}」里的文件。`}
+          </p>
+        </>
+      )}
+    </>
+  );
 
   return (
-    <div className="app">
-      <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark">G</span>
-          <div>
-            <h1>GoldenAgent</h1>
-            <p className="brand-sub">
-              {providerLabel} · {snapshot?.messages ?? 0} 条消息
-            </p>
-          </div>
-        </div>
-
-        <div className="controls">
-          <label className="mode">
-            <span>权限</span>
-            <select
-              value={snapshot?.mode ?? "ask"}
-              onChange={(event) => void changeMode(event.target.value)}
-              disabled={busy}
-            >
-              {(modes.length > 0 ? modes : ["ask"]).map((mode) => (
-                <option key={mode} value={mode}>
-                  {MODE_LABELS[mode] ?? mode}
-                </option>
-              ))}
-            </select>
-          </label>
-          <button type="button" className="ghost" onClick={() => void newSession()}>
-            新对话
-          </button>
-          <button
-            type="button"
-            className={showLog ? "ghost active" : "ghost"}
-            onClick={() => setShowLog((value) => !value)}
-          >
-            事件
-          </button>
-          <button
-            type="button"
-            className={
-              providerState === "ready" ? "ghost" : "ghost attention"
-            }
-            onClick={openSettings}
-          >
-            设置
-          </button>
-        </div>
-      </header>
+    <div
+      className={sideCollapsed ? "app side-collapsed" : "app"}
+      style={{ "--side-w": `${sideWidth}px` } as React.CSSProperties}
+    >
+      <Topbar
+        snapshot={snapshot}
+        modes={modes}
+        busy={busy}
+        sideCollapsed={sideCollapsed}
+        eventsOpen={eventsOpen}
+        onToggleSide={() => setSideCollapsed((value) => !value)}
+        onToggleEvents={() => setEventsOpen((value) => !value)}
+        onSearch={() => {
+          setSearchQuery("");
+          setSearchOpen(true);
+        }}
+        onNewSession={() => void newSession(snapshot?.active_space_id ?? null)}
+        onOpenSettings={() => setSettingsOpen(true)}
+        onChangeMode={(mode) => {
+          void api.setMode(mode).finally(() => void refresh());
+        }}
+      />
 
       <main className="body">
-        <aside className="sidebar">
-          <div className="sidebar-head">
-            <span>会话</span>
-            <span className="sidebar-count">{sessions.length}</span>
-          </div>
+        {!sideCollapsed && (
+          <Sidebar
+            spaces={spaces}
+            sessions={sessions}
+            activeId={activeId}
+            activeSpaceId={snapshot?.active_space_id ?? null}
+            busy={busy}
+            archivedOpen={archivedOpen}
+            renaming={renaming}
+            renameDraft={renameDraft}
+            onRenameDraft={setRenameDraft}
+            onCommitRename={() => void commitRename()}
+            onCancelRename={cancelRename}
+            onOpenSession={(id) => void openSession(id)}
+            onNewSession={(spaceId) => void newSession(spaceId)}
+            onSessionMenu={(session, at) => setMenu({ target: { kind: "session", session }, at })}
+            onSpaceMenu={(space, at) => setMenu({ target: { kind: "space", space }, at })}
+            onCreateSpace={() => setSpaceDialog({ mode: "create" })}
+            onToggleArchived={() => setArchivedOpen((value) => !value)}
+            onResizeStart={startResize}
+            width={sideWidth}
+          />
+        )}
 
-          <div className="session-list">
-            {sessions.length === 0 && (
-              <p className="session-empty">还没有历史。说第一句话就会出现在这里。</p>
-            )}
+        <section className="chat">
+          <ChatHead
+            title={activeSession?.title ?? "新对话"}
+            workspace={snapshot?.workspace ?? ""}
+            spaceName={activeSpaceName}
+            searchOpen={sessionSearchOpen}
+            onToggleSearch={() => {
+              setSessionSearchOpen((value) => !value);
+              setSessionQuery("");
+            }}
+          />
 
-            {sessions.map((session) => {
-              const active = session.id === activeId;
-              const isRenaming = renaming === session.id;
-
-              return (
-                <div
-                  className={active ? "session active" : "session"}
-                  key={session.id}
-                >
-                  {isRenaming ? (
-                    <input
-                      className="session-rename"
-                      value={renameDraft}
-                      autoFocus
-                      onChange={(event) => setRenameDraft(event.target.value)}
-                      onBlur={() => void commitRename()}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") {
-                          event.preventDefault();
-                          void commitRename();
-                        }
-                        if (event.key === "Escape") {
-                          event.preventDefault();
-                          cancelRename();
-                        }
-                      }}
-                    />
-                  ) : (
-                    <>
-                      <button
-                        type="button"
-                        className="session-main"
-                        onClick={() => void openSession(session.id)}
-                        disabled={busy || active}
-                        title={session.title}
-                      >
-                        <span className="session-title">{session.title}</span>
-                        <span className="session-meta">
-                          {session.messages} 条 · {relativeTime(session.updated_at_ms)}
-                        </span>
-                      </button>
-
-                      <div className="session-actions">
-                        <button
-                          type="button"
-                          className="icon"
-                          onClick={() => startRename(session)}
-                          title="改名"
-                        >
-                          改名
-                        </button>
-                        {confirmDelete === session.id ? (
-                          <button
-                            type="button"
-                            className="icon danger"
-                            onClick={() => void removeSession(session.id)}
-                            title="再点一次确认删除"
-                          >
-                            确认
-                          </button>
-                        ) : (
-                          <button
-                            type="button"
-                            className="icon"
-                            onClick={() => setConfirmDelete(session.id)}
-                            title="删除这条会话"
-                          >
-                            删除
-                          </button>
-                        )}
-                      </div>
-                    </>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </aside>
-
-        <div className="transcript" ref={transcriptRef}>
-          {entries.length === 0 && (
-            <div className="empty">
-              {providerState === "unconfigured" ? (
-                <>
-                  <p>还没接模型。</p>
-                  <p className="empty-hint">
-                    现在跑的是离线回显：你说什么它就把话回给你，工具与权限流程都能试。
-                    填一个 API Key 就能接真模型——配置只存在本机，不会上传到任何地方。
-                  </p>
-                  <button
-                    type="button"
-                    className="primary"
-                    onClick={openSettings}
-                  >
-                    配置模型
-                  </button>
-                  {setup && (
-                    <p className="empty-path">
-                      也可以自己编辑：{setup.config_path}
-                    </p>
-                  )}
-                </>
-              ) : providerState === "degraded" ? (
-                <>
-                  <p>模型配置有问题，暂时退回离线回显。</p>
-                  <p className="empty-warn">{snapshot?.provider_reason}</p>
-                  <button
-                    type="button"
-                    className="primary"
-                    onClick={openSettings}
-                  >
-                    去修配置
-                  </button>
-                </>
-              ) : (
-                <>
-                  <p>说点什么。</p>
-                  <p className="empty-hint">
-                    {snapshot?.provider === "mock"
-                      ? "当前显式配置为离线回显，它会把你的话原样回给你，工具照常可用。"
-                      : `已接入 ${snapshot?.model ?? ""}，可以读写工作区内的文件。`}
-                  </p>
-                </>
-              )}
-            </div>
+          {sessionSearchOpen && (
+            <SessionSearch
+              query={sessionQuery}
+              onQuery={setSessionQuery}
+              hits={sessionSearchHits}
+              onPick={(index) => {
+                setFlash({ index, token: Date.now() });
+                setSessionSearchOpen(false);
+              }}
+              onClose={() => setSessionSearchOpen(false)}
+            />
           )}
 
-          {entries.map((entry, index) => {
-            if (entry.kind === "user") {
-              return (
-                <div className="row user" key={index}>
-                  <div className="bubble">{entry.text}</div>
-                </div>
-              );
-            }
+          <Transcript
+            entries={entries}
+            busy={busy}
+            highlight={flash}
+            empty={empty}
+          />
 
-            if (entry.kind === "assistant") {
-              return (
-                <div className="row assistant" key={index}>
-                  <div className="bubble">{entry.text}</div>
-                </div>
-              );
-            }
+          <Composer
+            value={input}
+            busy={busy}
+            modeLabel={modeLabel}
+            onChange={setInput}
+            onSend={() => void send()}
+            onCancel={() => void api.cancel()}
+          />
+        </section>
 
-            if (entry.kind === "thinking") {
-              // 还在流式的最后一块保持展开，结束那一帧自动收起；
-              // 用户手动展开后不会再被事件推回去（对同一块不再有事件）。
-              const streaming = index === entries.length - 1 && busy;
-              return (
-                <div className="row thinking" key={index}>
-                  <details className="thinking-box" open={streaming}>
-                    <summary>
-                      <span className="thinking-label">
-                        {streaming ? "思考中…" : "思考过程"}
-                      </span>
-                      <span className="thinking-meta">{entry.text.length} 字</span>
-                    </summary>
-                    <pre className="thinking-text">{entry.text}</pre>
-                  </details>
-                </div>
-              );
-            }
-
-            if (entry.kind === "notice") {
-              return (
-                <div
-                  className={`notice ${entry.level}`}
-                  key={index}
-                >
-                  {entry.text}
-                </div>
-              );
-            }
-
-            return (
-              <div className={`tool ${entry.status}`} key={entry.id}>
-                <div className="tool-head">
-                  <span className="tool-name">{entry.name}</span>
-                  <span className="tool-status">
-                    {entry.status === "running"
-                      ? "执行中"
-                      : entry.status === "ok"
-                        ? "完成"
-                        : "失败"}
-                  </span>
-                </div>
-                <pre className="tool-input">
-                  {JSON.stringify(entry.input, null, 2)}
-                </pre>
-                {entry.output !== undefined && (
-                  <pre className="tool-output">{entry.output}</pre>
-                )}
-              </div>
-            );
-          })}
-        </div>
-
-        {showLog && (
-          <aside className="log">
-            <div className="log-head">事件流（{log.length}）</div>
-            <div className="log-body">
-              {log.map((event, index) => (
-                <div className="log-line" key={index}>
-                  <span className="log-type">{event.type}</span>
-                  <span className="log-payload">
-                    {JSON.stringify(event).slice(0, 160)}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </aside>
+        {eventsOpen && (
+          <EventsPanel
+            events={events}
+            sessionId={activeId}
+            onClose={() => setEventsOpen(false)}
+          />
         )}
       </main>
 
@@ -806,240 +594,133 @@ export default function App() {
             <span className="permission-summary">{permission.summary}</span>
           </div>
           <div className="permission-actions">
-            <button
-              type="button"
-              className="primary"
-              onClick={() => void answerPermission(true)}
-            >
+            <button type="button" className="primary" onClick={() => void answerPermission(true)}>
               允许
             </button>
-            <button
-              type="button"
-              className="ghost"
-              onClick={() => void answerPermission(false)}
-            >
+            <button type="button" className="ghost" onClick={() => void answerPermission(false)}>
               拒绝
             </button>
           </div>
         </div>
       )}
 
-      {showSettings && (
+      {menu && (
+        <SessionMenu
+          target={menu.target}
+          at={menu.at}
+          busy={busy}
+          activeId={activeId}
+          onClose={() => setMenu(null)}
+          onPin={(session, pinned) => void pin(session, pinned)}
+          onRename={startRename}
+          onReveal={(session) => void reveal(session)}
+          onArchive={(session, archived) => void archive(session, archived)}
+          onDeleteForever={(session) => setDeleteTarget(session)}
+          onEditSpace={(space) => setSpaceDialog({ mode: "edit", space })}
+          onDeleteSpace={(space) => setSpaceDialog({ mode: "edit", space })}
+        />
+      )}
+
+      {spaceDialog && (
+        <SpaceDialog
+          mode={spaceDialog.mode}
+          space={spaceDialog.mode === "edit" ? spaceDialog.space : undefined}
+          busy={busy}
+          onClose={() => setSpaceDialog(null)}
+          onSubmit={async (name, path) => {
+            if (spaceDialog.mode === "create") {
+              await api.createSpace(name, path);
+            } else {
+              await api.updateSpace(
+                spaceDialog.space.id,
+                name === spaceDialog.space.name ? null : name,
+                path === spaceDialog.space.path ? null : path,
+              );
+            }
+            setSpaceDialog(null);
+            await refresh();
+          }}
+          onDelete={
+            spaceDialog.mode === "edit"
+              ? async (space) => {
+                  await api.deleteSpace(space.id);
+                  setSpaceDialog(null);
+                  await refresh();
+                }
+              : undefined
+          }
+        />
+      )}
+
+      {searchOpen && (
+        <GlobalSearch
+          query={searchQuery}
+          onQuery={setSearchQuery}
+          results={searchResults}
+          spaces={spaces}
+          loading={searchLoading}
+          error={searchError}
+          onPick={pickSearchHit}
+          onClose={() => setSearchOpen(false)}
+        />
+      )}
+
+      {deleteTarget && (
         <div
-          className="sheet-backdrop"
+          className="overlay"
           onMouseDown={(event) => {
-            // 只在点空白处关闭；拖选文字时松手落在遮罩上不该误关。
-            if (event.target === event.currentTarget) setShowSettings(false);
+            if (event.target === event.currentTarget) setDeleteTarget(null);
           }}
         >
-          <div className="sheet" role="dialog" aria-label="设置">
-            <header className="sheet-head">
-              <h2>设置</h2>
+          <div className="dlg small" role="dialog" aria-label="永久删除会话">
+            <header className="dlg-head">
+              <h2>永久删除</h2>
               <button
                 type="button"
-                className="icon"
-                onClick={() => setShowSettings(false)}
+                className="icon-btn"
+                onClick={() => setDeleteTarget(null)}
+                aria-label="关闭"
               >
-                关闭
+                ✕
               </button>
             </header>
-
-            <div className="sheet-body">
-              <section>
-                <h3>模型</h3>
-                <p className="sheet-note">
-                  保存后立即生效，不用重启。配置写在下面的文件里，只存在本机。
-                </p>
-
-                <label className="field">
-                  <span>厂商</span>
-                  <select
-                    value={form.kind}
-                    onChange={(event) => {
-                      const kind = event.target.value;
-                      const option = setup?.catalog.find((o) => o.id === kind);
-                      setForm((prev) => ({
-                        ...prev,
-                        kind,
-                        // 换厂商就把模型名重置成该厂商的默认值；
-                        // 留着上一家的模型名只会换来一个 404。
-                        model: option?.default_model ?? "",
-                      }));
-                    }}
-                  >
-                    {(setup?.catalog ?? [{ id: "mock", default_model: "mock", needs_key: false }]).map(
-                      (option) => (
-                        <option key={option.id} value={option.id}>
-                          {PROVIDER_LABELS[option.id] ?? option.id}
-                        </option>
-                      ),
-                    )}
-                  </select>
-                </label>
-
-                <label className="field">
-                  <span>模型名</span>
-                  <input
-                    value={form.model}
-                    placeholder={currentOption?.default_model ?? "留空使用厂商默认"}
-                    onChange={(event) =>
-                      setForm((prev) => ({ ...prev, model: event.target.value }))
-                    }
-                  />
-                </label>
-
-                <label className="field">
-                  <span>API Key</span>
-                  <input
-                    type="password"
-                    value={form.api_key}
-                    placeholder={keyPlaceholder}
-                    autoComplete="off"
-                    disabled={currentOption?.needs_key === false}
-                    onChange={(event) =>
-                      setForm((prev) => ({ ...prev, api_key: event.target.value }))
-                    }
-                  />
-                </label>
-
-                <label className="field">
-                  <span>接口地址</span>
-                  <input
-                    value={form.base_url}
-                    placeholder="留空使用官方地址；自建网关/代理时填这里"
-                    onChange={(event) =>
-                      setForm((prev) => ({ ...prev, base_url: event.target.value }))
-                    }
-                  />
-                </label>
-
-                <label className="field">
-                  <span>最大输出 tokens</span>
-                  <input
-                    type="number"
-                    min={256}
-                    max={32768}
-                    step={256}
-                    value={form.max_tokens}
-                    placeholder={String(setup?.max_tokens ?? 8192)}
-                    onChange={(event) =>
-                      setForm((prev) => ({ ...prev, max_tokens: event.target.value }))
-                    }
-                  />
-                </label>
-                <p className="sheet-note">
-                  推理模型的思考过程也占用这份额度。额度被思考吃光时，正文一个字
-                  都不会出现——碰到"全用在思考上"的报错，先把它调大。
-                </p>
-
-                {saveError && <p className="sheet-error">{saveError}</p>}
-
-                <div className="sheet-actions">
-                  <button
-                    type="button"
-                    className="primary"
-                    onClick={() => void saveProvider()}
-                    disabled={saving}
-                  >
-                    {saving ? "保存中…" : "保存并生效"}
-                  </button>
-                </div>
-              </section>
-
-              <section>
-                <h3>配置文件</h3>
-                <code className="sheet-path">{setup?.config_path ?? "—"}</code>
-                <p className="sheet-note">
-                  手动改这个文件也可以，改完重启生效。里面的 Key 是明文，
-                  别把它提交到仓库。
-                </p>
-                <div className="sheet-actions">
-                  <button
-                    type="button"
-                    className="ghost"
-                    onClick={() => void copyTemplate()}
-                  >
-                    复制模板
-                  </button>
-                  {copied && <span className="sheet-ok">已复制</span>}
-                </div>
-                <details>
-                  <summary>看模板</summary>
-                  <pre className="sheet-pre">{setup?.template ?? ""}</pre>
-                </details>
-              </section>
-
-              <section>
-                <h3>关于</h3>
-                <dl className="sheet-facts">
-                  <dt>版本</dt>
-                  <dd>{info?.version ?? snapshot?.version ?? "—"}</dd>
-                  <dt>标识</dt>
-                  <dd>{info?.identifier ?? "—"}</dd>
-                  <dt>工作区</dt>
-                  <dd>
-                    {info?.workspace ?? "—"}
-                    {info && (
-                      <span className="sheet-tag">
-                        {WORKSPACE_LABELS[info.workspace_origin] ??
-                          info.workspace_origin}
-                      </span>
-                    )}
-                  </dd>
-                </dl>
-                {info?.update_url && (
-                  <a
-                    className="sheet-link"
-                    href={info.update_url}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    检查更新
-                  </a>
-                )}
-              </section>
+            <div className="dlg-body">
+              <p className="dlg-lead">
+                「{deleteTarget.title}」会被从磁盘删掉，<strong>不能恢复</strong>。
+                只是想让它离开列表的话，用「归档」。
+              </p>
             </div>
+            <footer className="dlg-foot">
+              <button type="button" className="ghost" onClick={() => setDeleteTarget(null)}>
+                取消
+              </button>
+              <button type="button" className="danger" onClick={() => void deleteForever()}>
+                永久删除
+              </button>
+            </footer>
           </div>
         </div>
       )}
 
-      <footer className="composer">
-        <textarea
-          value={input}
-          placeholder={`给 GoldenAgent 说点什么（当前权限：${modeLabel}）`}
-          rows={3}
-          onChange={(event) => setInput(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
-              event.preventDefault();
-              void send();
-            }
+      {settingsOpen && (
+        <SettingsSheet
+          setup={setup}
+          info={info}
+          snapshot={snapshot}
+          onClose={() => setSettingsOpen(false)}
+          onSaved={(next) => {
+            setSetup(next);
+            setSettingsOpen(false);
+            void refresh();
+          }}
+          onGoSpaces={() => {
+            setSettingsOpen(false);
+            setSpaceDialog({ mode: "create" });
           }}
         />
-        <div className="composer-actions">
-          <span className="hint">
-            {busy ? "运行中…" : "Enter 发送 · Shift+Enter 换行"}
-          </span>
-          {busy ? (
-            <button
-              type="button"
-              className="ghost"
-              onClick={() => void invoke("cancel")}
-            >
-              停止
-            </button>
-          ) : (
-            <button
-              type="button"
-              className="primary"
-              onClick={() => void send()}
-              disabled={input.trim().length === 0}
-            >
-              发送
-            </button>
-          )}
-        </div>
-      </footer>
+      )}
+
+      {toast && <div className="toast">{toast}</div>}
     </div>
   );
 }
