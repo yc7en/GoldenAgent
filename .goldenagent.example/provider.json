@@ -1,0 +1,10 @@
+{
+  "kind": "anthropic",
+  "model": "claude-sonnet-4-5",
+  "api_key": "",
+  "base_url": null,
+  "timeout_secs": 180,
+  "max_retries": 2,
+  "max_tokens": 8192,
+  "stream": true
+}

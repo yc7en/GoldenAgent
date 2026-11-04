@@ -1,0 +1,23 @@
+[package]
+name = "goldenagent-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GoldenAgent 桌面外壳：只做 command 转发与 event 转发"
+
+[lib]
+# lib 名刻意与 package 名（goldenagent-shell）不同：
+# 只差一个连字符/下划线会在 target 下撞同一个 pdb，cargo 会警告 output filename collision。
+name = "goldenagent_shell_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# 规则：第 5 层，唯一允许依赖 tauri 的地方。
+# 这里不写业务判断——没有 if/else 决定"该不该执行"，那是 policy 的事。
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+goldenagent-app = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }

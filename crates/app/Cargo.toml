@@ -1,0 +1,20 @@
+[package]
+name = "goldenagent-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 规则：第 4 层，可依赖下面所有 crate。仍然禁止 tauri。
+[dependencies]
+goldenagent-core = { workspace = true }
+goldenagent-provider = { workspace = true }
+goldenagent-tools = { workspace = true }
+goldenagent-policy = { workspace = true }
+goldenagent-session = { workspace = true }
+goldenagent-loop = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

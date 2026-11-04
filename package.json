@@ -1,0 +1,30 @@
+{
+  "name": "goldenagent",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "icon": "node scripts/gen-icon.mjs",
+    "check": "node scripts/check-layers.mjs",
+    "check:version": "node scripts/check-version.mjs",
+    "bundle:size": "node scripts/bundle-size.mjs",
+    "verify": "node scripts/check-layers.mjs && node scripts/check-version.mjs && cargo test --workspace && npm run build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.1.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3"
+  }
+}

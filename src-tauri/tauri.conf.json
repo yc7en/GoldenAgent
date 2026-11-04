@@ -1,0 +1,60 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "GoldenAgent",
+  "version": "0.1.0",
+  "identifier": "com.goldenagent.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:5320",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "GoldenAgent",
+        "width": 1080,
+        "height": 780,
+        "minWidth": 720,
+        "minHeight": 520,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "publisher": "GoldenAgent",
+    "copyright": "MIT License",
+    "category": "DeveloperTool",
+    "shortDescription": "跑在本机的编程助手",
+    "longDescription": "GoldenAgent 是一个完全跑在本机的编程助手：读写工作区文件、按内容搜索、按文件名查找、执行命令，权限按四档控制，会话随时续跑。模型可以是 Anthropic、任意 OpenAI 兼容接口，或离线回显。",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["SimpChinese"],
+        "displayLanguageSelector": false
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    },
+    "linux": {
+      "deb": {
+        "depends": []
+      }
+    }
+  }
+}

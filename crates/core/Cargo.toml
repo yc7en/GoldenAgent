@@ -1,0 +1,11 @@
+[package]
+name = "goldenagent-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 规则：本 crate 是第 0 层，禁止依赖任何其他内部 crate，也禁止出现 tauri。
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+# src-tauri 在 B7 落地后才加入 members；core crate 不得感知外壳。
+members = ["crates/*", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["GoldenAgent"]
+
+[workspace.dependencies]
+# --- 内部 crate：依赖方向由 scripts/check-layers.mjs 强制校验（见 ARCHITECTURE.md §6）---
+goldenagent-core = { path = "crates/core" }
+goldenagent-provider = { path = "crates/provider" }
+goldenagent-tools = { path = "crates/tools" }
+goldenagent-session = { path = "crates/session" }
+goldenagent-policy = { path = "crates/policy" }
+goldenagent-loop = { path = "crates/agent-loop" }
+goldenagent-app = { path = "crates/app" }
+
+# --- 第三方 ---
+anyhow = "1"
+async-trait = "0.1"
+# provider 层唯一的外部 IO 依赖。
+# 版本跟 Tauri 依赖树里的 reqwest（0.13）对齐，避免同时编译两份 hyper/tower。
+# 刻意 default-features = false：只用 json + native-tls（Windows 走 schannel，
+# 不引入 OpenSSL / ring）；流式所需的 stream feature 等 B9 第二步再打开。
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process"] }
+tracing = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

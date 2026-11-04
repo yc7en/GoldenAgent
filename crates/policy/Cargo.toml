@@ -1,0 +1,11 @@
+[package]
+name = "goldenagent-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 规则：第 2 层，可依赖 core 与 tools（复用 tools::jail 的路径归一化）。
+[dependencies]
+goldenagent-core = { workspace = true }
+goldenagent-tools = { workspace = true }
+serde_json = { workspace = true }
