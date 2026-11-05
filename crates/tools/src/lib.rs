@@ -15,6 +15,7 @@ mod glob;
 mod grep;
 mod list_dir;
 mod read_file;
+pub mod skill;
 mod walk;
 mod write_file;
 mod apply_patch;
@@ -37,6 +38,11 @@ pub struct ToolContext {
     pub workspace: PathBuf,
     /// 空间附加的目录：可以读写，但**不**参与相对路径解析。
     pub extra_roots: Vec<PathBuf>,
+    /// 技能根目录（只读资产）。
+    ///
+    /// 与 `workspace` 是**两个概念**：工作区是可读写的现场，技能根是只读的说明书。
+    /// 刻意不并进 `roots()`——那样 `write_file` 就写得进 skill 了（见 A-14）。
+    pub skills_root: Option<PathBuf>,
 }
 
 impl ToolContext {
@@ -44,6 +50,7 @@ impl ToolContext {
         Self {
             workspace: workspace.into(),
             extra_roots: Vec::new(),
+            skills_root: None,
         }
     }
 
@@ -52,7 +59,14 @@ impl ToolContext {
         Self {
             workspace: primary.into(),
             extra_roots: extra,
+            skills_root: None,
         }
+    }
+
+    /// 挂上技能根。只有 `use_skill` 会用它，路径判定仍是单根 + 白名单。
+    pub fn with_skills_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.skills_root = Some(root.into());
+        self
     }
 
     /// 主根 + 附加根，供 jail 判定。
@@ -102,6 +116,9 @@ impl Registry {
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
         registry.register(Arc::new(read_file::ReadFile));
+        // 技能是"让模型自己去读的说明书"，所以它紧跟在 read_file 后面：
+        // 两者是同一个动作的两种入口，区别只在能不能越出 skill 目录。
+        registry.register(Arc::new(skill::UseSkill));
         registry.register(Arc::new(write_file::WriteFile));
         registry.register(Arc::new(list_dir::ListDir));
         registry.register(Arc::new(grep::Grep));

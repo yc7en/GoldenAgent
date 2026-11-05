@@ -201,25 +201,26 @@ npm run check:version   # 版本号三处一致性（package.json / tauri.conf.j
 
 ## 当前进度
 
-B0–B18 全部完成。能力范围：
+B0–B19 全部完成。能力范围：
 
 - 分层骨架 + 五条门禁（R1–R5）+ 版本一致性检查
 - provider：离线回显 / Anthropic / OpenAI 兼容，SSE 流式，退避重试，**三态装配状态**
-- 工具七个：`read_file` `list_dir` `grep` `glob` `write_file` `apply_patch` `bash`
+- 工具八个：`read_file` `list_dir` `grep` `glob` `write_file` `apply_patch` `bash`，外加只读的 `use_skill`
 - 四档权限，`Exec` 类单独定档，授权条带超时拒绝
 - 会话：内存 + 多会话 `sessions/<space>/<id>.jsonl`，可列可恢复可改名；置顶 / 归档 / 全局搜索
 - **空间**：可切换的活动工作区，会话按空间分目录，工具与授权按空间的目录走
 - **多根工作区**：一个空间可再附加最多 8 个目录，同样可读写；相对路径只挂主目录
-- 上下文压缩、取消、端到端场景回归（12 个场景断言完整事件序列）
+- **技能**：把 `SKILL.md` 放进 `.goldenagent/skills/<id>/` 即可，清单进系统提示、正文按需读（只读版，无安装器）
+- 上下文压缩、取消、端到端场景回归（13 个场景断言完整事件序列）
 - 安装包产出、界面内配 provider、体积预算、工作区落点（不会把安装目录当项目）
 
 验证状态：
 
 - `npm run verify` —— 退出码 0（门禁 R1–R5 + 版本一致性 + 全量测试 + 前端构建）
-- `cargo test --workspace` —— **274 用例全过，无代码警告**（Windows 的增量编译锁文件
+- `cargo test --workspace` —— **298 用例全过，无代码警告**（Windows 的增量编译锁文件
   警告是环境噪音，不计入）
-- `npm run tauri build` —— 通过，产出 NSIS 安装包（`GoldenAgent_0.1.0_x64-setup.exe`，2.59 MiB）
-- `npm run bundle:size` —— 在预算内（主程序 11.18 / 20 MiB，安装包 2.59 / 10 MiB）
+- `npm run tauri build` —— 通过，产出 NSIS 安装包（`GoldenAgent_0.1.0_x64-setup.exe`，2.60 MiB）
+- `npm run bundle:size` —— 在预算内（主程序 11.25 / 20 MiB，安装包 2.60 / 10 MiB）
 
 > 判断一次改动是改进还是退步，以及每次改动要交哪些证据，见 [`评价标准.md`](评价标准.md)。
 

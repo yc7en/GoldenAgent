@@ -85,6 +85,11 @@ pub struct Config {
     pub compact_at: Option<usize>,
     /// 压缩后保留的消息条数。
     pub compact_keep: usize,
+    /// 技能根目录。`None` 表示这台机器没启用技能，`use_skill` 会明确报错。
+    ///
+    /// 它是**只读资产**，与工作区是两回事：不进 `Policy::roots()`，
+    /// 也不参与相对路径解析（见 ARCHITECTURE A-14）。
+    pub skills_root: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -96,6 +101,7 @@ impl Default for Config {
             max_turns: 12,
             compact_at: None,
             compact_keep: 8,
+            skills_root: None,
         }
     }
 }
@@ -129,10 +135,14 @@ impl AgentLoop {
         // 工具拿到的根集合必须与 policy 判定用的完全一致：两处各取一份，
         // 就会出现"policy 放行、jail 拒绝"（或反过来）的分歧。
         let roots = policy.roots();
-        let ctx = match roots.split_first() {
+        let mut ctx = match roots.split_first() {
             Some((primary, rest)) => ToolContext::with_roots(primary.clone(), rest.to_vec()),
             None => ToolContext::new(policy.workspace()),
         };
+        // 技能根单独挂：它不是工作区，不进 policy 的根集合（A-14）。
+        if let Some(skills) = config.skills_root.clone() {
+            ctx = ctx.with_skills_root(skills);
+        }
         Self {
             provider,
             tools,

@@ -20,6 +20,7 @@ use goldenagent_provider::{
     MockProvider, Provider, ProviderConfig, MAX_MAX_TOKENS, MIN_MAX_TOKENS,
 };
 use goldenagent_session::{Session, SessionCatalog, SessionStore, SpaceStore};
+use goldenagent_tools::skill::{self, MAX_PROMPT_BYTES};
 use goldenagent_tools::Registry;
 use tokio::sync::Mutex;
 
@@ -60,6 +61,11 @@ pub struct AgentConfig {
     /// 应用状态目录（`.goldenagent`）：放 `spaces.json` 与 `sessions/`。
     /// 它同时是空间路径的禁区——Agent 不该能改自己的会话与明文 key。
     pub state_dir: Option<PathBuf>,
+    /// 技能目录（只读指令包）。`None` 表示这台机器不启用技能。
+    ///
+    /// 默认跟着状态目录走（`<state>/skills`），与 `spaces.json`、`sessions/` 并列——
+    /// 它们是同一类东西：属于这台机器、不属于某个空间。
+    pub skills_dir: Option<PathBuf>,
 }
 
 impl AgentConfig {
@@ -77,6 +83,7 @@ impl AgentConfig {
             approval_timeout: Duration::from_secs(120),
             session_dir: None,
             state_dir: None,
+            skills_dir: None,
         }
     }
 
@@ -89,6 +96,9 @@ impl AgentConfig {
         let dir = dir.into();
         self.state_dir = dir.parent().map(Path::to_path_buf);
         self.session_dir = Some(dir);
+        // 显式给了会话目录也顺手挂上同级的 skills/：测试与 CLI 不会去调 with_state_dir，
+        // 少了这一步就会出现"应用里有技能、测试里没有"的双重行为。
+        self.skills_dir = self.state_dir.as_ref().map(|s| s.join(SKILLS_DIR));
         self
     }
 
@@ -96,6 +106,7 @@ impl AgentConfig {
     pub fn with_state_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
         self.session_dir = Some(dir.join(goldenagent_session::SESSIONS_DIR));
+        self.skills_dir = Some(dir.join(SKILLS_DIR));
         self.state_dir = Some(dir);
         self
     }
@@ -112,6 +123,69 @@ const DEFAULT_SYSTEM: &str = "你是 GoldenAgent，一个运行在用户本机�
 做事之前先看再改：不确定路径就先 list_dir 或 glob，找代码先 grep，别猜。\
 只改几行用 apply_patch，整份重写才用 write_file——后者会把没读到的内容一起冲掉。\
 执行命令前想清楚它会不会动到工作区外的东西。回答用中文，简洁直接。";
+
+/// 技能目录名。与 `sessions/`、`spaces.json` 并列放在状态目录下——
+/// 它们都属于「这台机器」，不属于某个空间。
+const SKILLS_DIR: &str = "skills";
+
+/// 把「可用技能」拼进系统提示。
+///
+/// 只放 id + 一句话，正文由模型自己 `use_skill` 去读：N 个技能各几 KB，
+/// 全量注入会把上下文吃光，而这正是技能要解决的问题（渐进披露）。
+///
+/// **没有技能目录时原样返回**——不是"返回一个空段落"，
+/// 保证不装技能的用户拿到的提示词与上一版逐字节相同。
+fn system_with_skills(system: &str, dir: Option<&Path>) -> String {
+    let Some(dir) = dir else {
+        return system.to_string();
+    };
+    let report = skill::scan(dir);
+    if report.skills.is_empty() && report.skipped.is_empty() {
+        return system.to_string();
+    }
+
+    let mut out = String::with_capacity(system.len() + 512);
+    out.push_str(system);
+
+    if !report.skills.is_empty() {
+        out.push_str("\n\n可以按需调用的技能（需要时先调 use_skill 读正文，name 传冒号前的那个 id）：\n");
+        let mut listed = 0usize;
+        for item in &report.skills {
+            let line = item.outline();
+            if out.len() + line.len() + 1 > MAX_PROMPT_BYTES {
+                break;
+            }
+            out.push_str(&line);
+            out.push('\n');
+            listed += 1;
+        }
+        if listed < report.skills.len() {
+            out.push_str(&format!(
+                "（另有 {} 个技能因清单长度上限未列出）\n",
+                report.skills.len() - listed
+            ));
+        }
+        out.push_str("技能里写的操作同样受当前权限档约束，不会被自动放行；不确定就按它写的顺序做，别凭印象编步骤。");
+    }
+
+    // 装失败的目录也要说出来：用户放了个技能却不生效时，
+    // 「为什么」比「有没有」更难查，让模型能直接答上来。
+    if !report.skipped.is_empty() {
+        let listed: Vec<String> = report
+            .skipped
+            .iter()
+            .take(3)
+            .map(|s| format!("{}（{}）", s.id, s.reason))
+            .collect();
+        out.push_str(&format!(
+            "\n另有 {} 个技能目录未加载：{}。",
+            report.skipped.len(),
+            listed.join("；")
+        ));
+    }
+
+    out
+}
 
 /// provider 及它周围那些会变的东西。
 ///
@@ -516,6 +590,13 @@ impl AgentService {
 
     /// 启动时备好状态目录、清单与旧布局迁移。返回清单问题（没有就是 `None`）。
     pub async fn bootstrap(&self) -> Result<Option<String>> {
+        // 技能目录先建出来。空目录本身不做任何事，但它让用户在文件管理器里
+        // **看到**该往哪儿放——否则"目录即安装"就等于没说安装位置。
+        // 建不出来不阻断启动：扫描时目录不存在只会得到空清单。
+        if let Some(dir) = &self.config.skills_dir {
+            let _ = tokio::fs::create_dir_all(dir).await;
+        }
+
         let Some(store) = &self.space_store else {
             return Ok(None);
         };
@@ -1040,17 +1121,24 @@ impl AgentService {
         // 只快照主根会让"附加目录在中途变了"这件事从 side door 溜进来。
         let roots = self.roots();
         let policy = Policy::with_roots(self.mode(), roots);
+
+        // 技能每轮扫一次（几十个几 KB 的文件），换来的是"放进去就生效"——
+        // 不需要重启应用，也不会有"清单与磁盘不一致"的中间态。
+        let skills_root = self.config.skills_dir.clone();
+        let system = system_with_skills(&self.config.system, skills_root.as_deref());
+
         let agent = AgentLoop::new(
             provider,
             Arc::clone(&self.tools),
             policy,
             Config {
                 model,
-                system: self.config.system.clone(),
+                system,
                 max_tokens,
                 max_turns: self.config.max_turns,
                 compact_at: self.config.compact_at,
                 compact_keep: self.config.compact_keep,
+                skills_root,
             },
         );
 
@@ -1115,4 +1203,84 @@ fn is_inside(path: &Path, base: &Path) -> bool {
         return path == base || path.starts_with(&format!("{}\\", base.trim_end_matches('\\')));
     }
     path == base || path.starts_with(&base)
+}
+
+#[cfg(test)]
+mod skill_prompt_tests {
+    use super::*;
+
+    fn temp(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("goldenagent-prompt-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_skill(root: &Path, id: &str, body: &str) {
+        let dir = root.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), body).unwrap();
+    }
+
+    /// 不装技能的用户，提示词必须与上一版**逐字节相同**。
+    #[test]
+    fn no_skills_dir_keeps_the_prompt_untouched() {
+        let base = "你是助手";
+        assert_eq!(system_with_skills(base, None), base);
+
+        let empty = temp("empty");
+        assert_eq!(system_with_skills(base, Some(&empty)), base);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn skills_are_listed_but_their_body_is_not_inlined() {
+        let root = temp("list");
+        write_skill(
+            &root,
+            "pdf",
+            "---\nname: PDF 处理\ndescription: 处理 PDF 时用\n---\n正文不该出现在提示里\n",
+        );
+
+        let out = system_with_skills("你是助手", Some(&root));
+
+        assert!(out.starts_with("你是助手"), "原有提示词要保留");
+        assert!(out.contains("- pdf（PDF 处理）：处理 PDF 时用"), "{out}");
+        assert!(out.contains("use_skill"), "要告诉模型怎么读正文");
+        assert!(!out.contains("正文不该出现在提示里"), "正文必须按需读，不能内联");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn broken_skill_dirs_are_reported_not_swallowed() {
+        let root = temp("broken");
+        write_skill(&root, "ok", "---\ndescription: 好的\n---\n");
+        write_skill(&root, "broken", "没有 frontmatter\n");
+
+        let out = system_with_skills("你是助手", Some(&root));
+
+        assert!(out.contains("未加载"), "{out}");
+        assert!(out.contains("broken"), "要说清是哪个目录: {out}");
+        assert!(out.contains("description"), "要说清为什么: {out}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 32 个满配描述会超过 8 KiB，超出部分必须被截断并且**说出来**。
+    #[test]
+    fn oversized_list_is_clipped_and_admits_it() {
+        let root = temp("huge");
+        let long = "说".repeat(190);
+        for i in 0..skill::MAX_SKILLS {
+            write_skill(&root, &format!("s{i:02}"), &format!("---\ndescription: {long}\n---\n"));
+        }
+
+        let out = system_with_skills("你是助手", Some(&root));
+
+        assert!(out.len() <= skill::MAX_PROMPT_BYTES + 512, "清单不能无限长");
+        assert!(out.contains("因清单长度上限未列出"), "{out}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

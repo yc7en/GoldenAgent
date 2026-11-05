@@ -268,6 +268,23 @@ fn service(ws: &Workspace, vendor: &Vendor, mode: Mode) -> AgentService {
     AgentService::new(AgentConfig::new(&ws.path).with_mode(mode), provider)
 }
 
+/// 带应用状态目录的装配：技能与空间都挂在这上面（`<state>/skills`）。
+fn service_with_state(ws: &Workspace, vendor: &Vendor, mode: Mode) -> AgentService {
+    let provider = ProviderConfig::anthropic("claude-test", "sk-test")
+        .with_base_url(&vendor.base_url)
+        .with_max_retries(0)
+        .build()
+        .expect("构建 provider");
+
+    let state = ws.path.join(".goldenagent");
+    AgentService::new(
+        AgentConfig::new(&ws.path)
+            .with_mode(mode)
+            .with_state_dir(&state),
+        provider,
+    )
+}
+
 /// 跑一轮，把事件按顺序收全。
 ///
 /// 返回 `Result` 而不是直接 unwrap：provider 出错时整轮就是 `Err`，
@@ -821,5 +838,53 @@ async fn scenario_max_tokens_from_config_reaches_the_request() {
         bodies[0]["max_tokens"],
         json!(16000),
         "配置里的额度没传到请求体，等于白配"
+    );
+}
+
+/// 场景 13：技能进系统提示，模型按名字读得到正文。
+///
+/// 这条要同时证明两件事，少一件都等于没做到：
+/// 1. **清单进了提示**——否则模型不知道有这个技能；
+/// 2. **正文没进提示**——否则"按需加载"就是一句空话，32 个技能会把上下文吃光。
+#[tokio::test]
+async fn scenario_skill_is_listed_then_read_on_demand() {
+    let ws = Workspace::new();
+    ws.write(
+        ".goldenagent/skills/pdf/SKILL.md",
+        "---\nname: PDF 处理\ndescription: 处理 PDF 时用\n---\n第一步：只提取文本\n",
+    );
+
+    let vendor = Vendor::start(vec![
+        Reply::Sse(tool_frames(&[(
+            "toolu_1",
+            "use_skill",
+            r#"{"name":"pdf"}"#,
+        )])),
+        Reply::Sse(text_frames(&["按技能做了"])),
+    ])
+    .await;
+    // ReadOnly 档：读技能不该要授权，但也不能因此获得别的能力。
+    let service = service_with_state(&ws, &vendor, Mode::ReadOnly);
+
+    let (events, outcome) = run(&service, "用 pdf 技能处理一下").await;
+    outcome.expect("正常一轮");
+
+    let bodies = vendor.bodies().await;
+    let system = bodies[0]["system"].to_string();
+    assert!(
+        system.contains("pdf（PDF 处理）：处理 PDF 时用"),
+        "技能清单没进系统提示: {system}"
+    );
+    assert!(
+        !system.contains("第一步：只提取文本"),
+        "正文被内联进提示了，按需加载没做到: {system}"
+    );
+
+    let results = tool_results(&events);
+    assert_eq!(results.len(), 1);
+    assert!(results[0].0, "use_skill 该成功: {results:?}");
+    assert!(
+        results[0].1.contains("第一步：只提取文本"),
+        "工具没读到正文: {results:?}"
     );
 }
