@@ -19,7 +19,8 @@ impl Tool for ListDir {
             json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "相对工作区的目录路径，默认 ." }
+                    "path": { "type": "string", "description": "相对工作区的目录路径，默认 ." },
+                    "summary": { "type": "string", "description": "简要操作意图（4-8字），如'查看项目目录结构'" }
                 }
             }),
             ToolKind::Read,

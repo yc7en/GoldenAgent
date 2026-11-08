@@ -20,7 +20,8 @@ impl Tool for WriteFile {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "相对工作区的路径" },
-                    "content": { "type": "string", "description": "完整文件内容（覆盖写）" }
+                    "content": { "type": "string", "description": "完整文件内容（覆盖写）" },
+                    "summary": { "type": "string", "description": "简要操作意图（4-8字），如'写入配置文件'" }
                 },
                 "required": ["path", "content"]
             }),

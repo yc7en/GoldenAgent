@@ -31,6 +31,7 @@ impl Tool for ApplyPatch {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "相对工作区的文件路径" },
+                    "summary": { "type": "string", "description": "简要操作意图（4-8字），如'更新渲染样式'" },
                     "edits": {
                         "type": "array",
                         "description": "按顺序应用的替换列表",

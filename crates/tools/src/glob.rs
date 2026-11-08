@@ -22,7 +22,8 @@ impl Tool for Glob {
                 "properties": {
                     "pattern": { "type": "string", "description": "通配模式，如 **/*.rs 或 src/*.ts" },
                     "path": { "type": "string", "description": "从哪个目录开始找，默认工作区根" },
-                    "limit": { "type": "integer", "description": "最多返回多少个文件，默认 200" }
+                    "limit": { "type": "integer", "description": "最多返回多少个文件，默认 200" },
+                    "summary": { "type": "string", "description": "简要操作意图（4-8字），如'搜索所有样式文件'" }
                 },
                 "required": ["pattern"]
             }),

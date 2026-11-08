@@ -352,8 +352,8 @@ button.icon.danger {
   border: 1px solid var(--border);
 }
 
-/* 思考过程：比正文弱一档。它可能是几百字，所以默认自动收起，
-   只在流式进行中展开——那段"看起来卡住了"的时间就靠它填上。 */
+/* 思考过程：比正文弱一档。它可能是几百到几千字，所以默认收起，
+   标题上的「思考中…」负责说明它还在跑。 */
 
 .row.thinking {
   align-self: flex-start;
@@ -371,28 +371,95 @@ button.icon.danger {
   font-size: 12px;
 }
 
-.thinking-box > summary {
-  cursor: pointer;
-  color: var(--text-dim);
+.icon-svg {
+  width: 15px;
+  height: 15px;
+  display: inline-block;
+  vertical-align: middle;
+  flex: none;
 }
 
-.thinking-label {
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+/* ---------------------------------------------------------------- 思考过程 */
+
+.thinking-box {
+  width: 100%;
+}
+
+.thinking-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  color: var(--text-dim);
+  list-style: none;
+  padding: 4px 0;
+  user-select: none;
+}
+
+.thinking-head::-webkit-details-marker {
+  display: none;
+}
+
+.thinking-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
   color: var(--accent-dim);
 }
 
+.thinking-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-dim);
+  transition: color 0.15s ease;
+}
+
+.thinking-head:hover .thinking-label {
+  color: var(--text);
+}
+
 .thinking-meta {
-  margin-left: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
   opacity: 0.7;
+  font-family: var(--mono);
+}
+
+.thinking-arrow {
+  display: flex;
+  align-items: center;
+  margin-left: auto;
+  color: var(--text-dim);
+  transition: transform 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.thinking-box[open] > .thinking-head .thinking-arrow {
+  transform: rotate(90deg);
 }
 
 .thinking-text {
-  margin: 8px 0 2px;
+  margin: 6px 0 4px;
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
   max-height: 320px;
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
   color: var(--text-dim);
   line-height: 1.6;
+  font-family: var(--mono);
+  font-size: 12px;
 }
 
 .notice {
@@ -411,19 +478,27 @@ button.icon.danger {
   border-color: #4a2222;
 }
 
-/* ---------------------------------------------------------------- 工具卡片 */
+/* ---------------------------------------------------------------- 工具步骤卡片 */
 
 .tool {
   align-self: flex-start;
-  max-width: min(720px, 88%);
+  max-width: min(760px, 92%);
   width: 100%;
   border: 1px solid var(--border);
-  border-left: 3px solid var(--text-dim);
+  border-left: 3px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg-sunken);
-  padding: 10px 12px;
-  font-family: var(--mono);
-  font-size: 12px;
+  padding: 6px 12px;
+  font-size: 13px;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.tool:hover {
+  background: var(--bg-raised);
+}
+
+.tool + .tool {
+  margin-top: -6px;
 }
 
 .tool.ok {
@@ -440,35 +515,150 @@ button.icon.danger {
 
 .tool-head {
   display: flex;
-  justify-content: space-between;
+  align-items: center;
   gap: 10px;
-  margin-bottom: 6px;
+  cursor: pointer;
+  list-style: none;
+  min-height: 28px;
+  user-select: none;
 }
 
-.tool-name {
-  color: var(--accent);
-  font-weight: 600;
+.tool-head::-webkit-details-marker {
+  display: none;
 }
 
-.tool-status {
+/* 左侧工具类型图标微章 */
+.tool-type-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.04);
   color: var(--text-dim);
+  flex: none;
+}
+
+.tool.running .tool-type-icon {
+  color: var(--accent);
+  background: rgba(245, 179, 1, 0.1);
+}
+
+.tool.ok .tool-type-icon {
+  color: var(--ok);
+}
+
+.tool.failed .tool-type-icon {
+  color: var(--danger);
+  background: rgba(255, 85, 85, 0.1);
+}
+
+/* 中间自然语言摘要标题 */
+.tool-summary-text {
+  flex: 1;
+  min-width: 0;
+  font-weight: 500;
+  color: var(--text);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  letter-spacing: 0.1px;
+}
+
+/* 参数细节灰色小药丸 */
+.tool-detail-pill {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.05);
+  padding: 1px 6px;
+  border-radius: 4px;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: none;
+}
+
+/* 右侧状态微标 */
+.tool-status-badge {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-dim);
+  flex: none;
+  margin-left: auto;
+}
+
+.tool-status-badge .status-icon {
+  width: 14px;
+  height: 14px;
+}
+
+.tool-status-badge .icon-ok {
+  color: var(--ok);
+}
+
+.tool-status-badge .icon-failed {
+  color: var(--danger);
+}
+
+.tool.failed .tool-status-badge {
+  color: var(--danger);
+}
+
+.tool.running .tool-status-badge {
+  color: var(--accent-dim);
+}
+
+/* 展开折叠箭头 */
+.tool-expand-arrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  flex: none;
+  transition: transform 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.tool-box[open] > .tool-head .tool-expand-arrow {
+  transform: rotate(90deg);
+}
+
+/* 展开后的正文详情容器 */
+.tool-body {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+
+.tool-body-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 6px;
+  margin-bottom: 3px;
 }
 
 .tool-input,
 .tool-output {
   margin: 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 11px;
   white-space: pre-wrap;
   word-break: break-word;
-  line-height: 1.55;
+  line-height: 1.5;
   color: var(--text-dim);
   max-height: 240px;
   overflow: auto;
 }
 
 .tool-output {
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px dashed var(--border);
   color: var(--text);
 }
 

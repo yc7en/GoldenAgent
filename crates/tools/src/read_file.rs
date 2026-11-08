@@ -23,7 +23,8 @@ impl Tool for ReadFile {
                 "properties": {
                     "path": { "type": "string", "description": "相对工作区的路径，如 src/main.rs" },
                     "offset": { "type": "integer", "description": "起始行号，从 1 开始，默认 1" },
-                    "limit": { "type": "integer", "description": "最多返回多少行，默认 2000" }
+                    "limit": { "type": "integer", "description": "最多返回多少行，默认 2000" },
+                    "summary": { "type": "string", "description": "简要操作意图（4-8字），如'查看入口函数'" }
                 },
                 "required": ["path"]
             }),

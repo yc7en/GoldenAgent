@@ -270,7 +270,8 @@ impl Tool for UseSkill {
                     "name": { "type": "string", "description": "技能名，即 skills 目录下的文件夹名" },
                     "path": { "type": "string", "description": "技能目录内的相对路径，默认 SKILL.md" },
                     "offset": { "type": "integer", "description": "起始行号，从 1 开始，默认 1" },
-                    "limit": { "type": "integer", "description": "最多返回多少行，默认 800" }
+                    "limit": { "type": "integer", "description": "最多返回多少行，默认 800" },
+                    "summary": { "type": "string", "description": "简要操作意图（4-8字），如'查阅技能文档'" }
                 },
                 "required": ["name"]
             }),

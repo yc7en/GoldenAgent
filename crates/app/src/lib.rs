@@ -17,7 +17,8 @@ use goldenagent_core::{Error, Result};
 use goldenagent_loop::{AgentLoop, Cancellation, Config};
 use goldenagent_policy::Policy;
 use goldenagent_provider::{
-    MockProvider, Provider, ProviderConfig, MAX_MAX_TOKENS, MIN_MAX_TOKENS,
+    MockProvider, Provider, ProviderConfig, MAX_CONTEXT_TOKENS, MAX_MAX_TOKENS, MAX_MAX_TURNS,
+    MIN_CONTEXT_TOKENS, MIN_MAX_TOKENS, MIN_MAX_TURNS,
 };
 use goldenagent_session::{Session, SessionCatalog, SessionStore, SpaceStore};
 use goldenagent_tools::skill::{self, MAX_PROMPT_BYTES};
@@ -35,6 +36,7 @@ pub use provider::{
 pub use workspace::{resolve as resolve_workspace, WorkspaceOrigin};
 // 外壳只需要认识这几个名字，不必自己再去依赖 core / loop / policy / session。
 pub use goldenagent_core::{Event, Message};
+pub use goldenagent_loop::compaction::Report as CompactReport;
 pub use goldenagent_loop::{EventSink, Outcome};
 pub use goldenagent_policy::Mode;
 pub use goldenagent_session::{
@@ -49,10 +51,24 @@ pub struct AgentConfig {
     pub model: String,
     pub system: String,
     pub max_tokens: u32,
-    pub max_turns: u32,
-    /// token 阈值，超过就压缩历史。`None` 关闭。
+    /// 单轮最多几轮模型往返。`None` = 跟随设置里的「最多轮次」。
+    ///
+    /// 默认让用户能在设置里改：12 轮对"改 -> 测 -> 再改"的活偏紧，
+    /// 撞上限时界面只会说"达到轮次上限"，用户却找不到地方调。
+    pub max_turns: Option<u32>,
+    /// 压缩触发阈值。`None` = 跟随 provider 配置里的「上下文上限」。
+    ///
+    /// 默认让用户能在设置里改，而不是写死在代码里——它直接影响成本和行为，
+    /// 藏起来的结果是"改了看不见"。嵌入方（测试、脚本）仍可显式给值覆盖。
     pub compact_at: Option<usize>,
+    /// 压缩时至少保留的消息条数（下限）。
     pub compact_keep: usize,
+    /// 压缩时保留的 token 预算。`None` = 取 `compact_at / 4`。
+    pub compact_keep_tokens: Option<usize>,
+    /// 是否让模型写摘要。关掉就退回"直接丢弃"的老行为。
+    pub compact_summary: bool,
+    /// 摘要单次输出上限。
+    pub summary_max_tokens: u32,
     pub mode: Mode,
     /// 授权等待上限。超时按拒绝处理。
     pub approval_timeout: Duration,
@@ -76,9 +92,15 @@ impl AgentConfig {
             system: DEFAULT_SYSTEM.into(),
             // 与 provider 侧的默认值保持一致：推理模型的思考也吃这份额度。
             max_tokens: goldenagent_provider::DEFAULT_MAX_TOKENS,
-            max_turns: 12,
-            compact_at: Some(48_000),
+            max_turns: None,
+            compact_at: None,
             compact_keep: 12,
+            // `None` = 保留 `compact_at / 4`，1M 窗口下就是 25 万 token 的原始尾部。
+            // 这个比例是刻意的：摘要覆盖的历史越少，丢失的细节越少。
+            compact_keep_tokens: None,
+            // 产品默认开：多花一次模型调用，换来模型不失忆。
+            compact_summary: true,
+            summary_max_tokens: 2048,
             mode: Mode::Ask,
             approval_timeout: Duration::from_secs(120),
             session_dir: None,
@@ -122,7 +144,9 @@ const DEFAULT_SYSTEM: &str = "你是 GoldenAgent，一个运行在用户本机�
 精确替换几行（apply_patch）、执行 shell 命令（bash）。\
 做事之前先看再改：不确定路径就先 list_dir 或 glob，找代码先 grep，别猜。\
 只改几行用 apply_patch，整份重写才用 write_file——后者会把没读到的内容一起冲掉。\
-执行命令前想清楚它会不会动到工作区外的东西。回答用中文，简洁直接。";
+执行命令前想清楚它会不会动到工作区外的东西。\
+调用工具时，必须在 summary 字段用精炼的中文短语（4-8字）说明操作意图（如'阅读主界面结构'、'查看样式定义'）。\
+回答用中文，简洁直接。";
 
 /// 技能目录名。与 `sessions/`、`spaces.json` 并列放在状态目录下——
 /// 它们都属于「这台机器」，不属于某个空间。
@@ -289,6 +313,18 @@ pub struct AgentService {
     approver: Arc<EventApprover>,
 }
 
+/// 一轮运行要用的装配参数。
+///
+/// 打包成结构体而不是元组：现在有五项，其中 `max_tokens` / `context_tokens` /
+/// `max_turns` 都是数字，位置写反了编译器不会吭声，只会表现为"改了没生效"。
+struct RunParts {
+    provider: Arc<dyn Provider>,
+    model: String,
+    max_tokens: u32,
+    context_tokens: usize,
+    max_turns: u32,
+}
+
 impl AgentService {
     pub fn new(config: AgentConfig, provider: Arc<dyn Provider>) -> Self {
         let approver = Arc::new(EventApprover::new(config.approval_timeout));
@@ -422,6 +458,12 @@ impl AgentService {
             max_tokens: runtime.max_tokens,
             max_tokens_min: MIN_MAX_TOKENS,
             max_tokens_max: MAX_MAX_TOKENS,
+            context_tokens: runtime.config.context_tokens,
+            context_tokens_min: MIN_CONTEXT_TOKENS,
+            context_tokens_max: MAX_CONTEXT_TOKENS,
+            max_turns: runtime.config.max_turns,
+            max_turns_min: MIN_MAX_TURNS,
+            max_turns_max: MAX_MAX_TURNS,
             config_path: runtime
                 .path
                 .clone()
@@ -1107,12 +1149,11 @@ impl AgentService {
         catalog.store(space_id.as_deref()).persist(&id, session).await
     }
 
-    /// 跑一轮对话。进度只从 `events` 出去，历史只从 `session` 出来。
-    pub async fn chat(&self, prompt: &str, events: &EventSink) -> Result<Outcome> {
-        // 先把 provider 与模型名取出来再放开锁：整轮对话可能跑几分钟，
-        // 期间不该阻塞用户去改配置。
-        let (provider, model, max_tokens) = self.agent_parts();
-
+    /// 组装一次运行用的循环：工作区快照 + 技能扫描 + 压缩配置。
+    ///
+    /// `chat` 与 `compact` 共用这一份。两处各拼一次是"配置漂移"的老来源——
+    /// 按需压缩用一套阈值、自动压缩用另一套，是最难查的那类不一致。
+    fn build_agent(&self, parts: RunParts) -> AgentLoop {
         // 工作区在整轮内**快照**（A-12）：从这里往下只认 `roots`，
         // 不再看 `active` 锁。这样即便切换请求漏进来，也不会出现
         // 「前半段在 A 目录、后半段在 B 目录」。
@@ -1127,20 +1168,36 @@ impl AgentService {
         let skills_root = self.config.skills_dir.clone();
         let system = system_with_skills(&self.config.system, skills_root.as_deref());
 
-        let agent = AgentLoop::new(
-            provider,
+        AgentLoop::new(
+            parts.provider,
             Arc::clone(&self.tools),
             policy,
             Config {
-                model,
+                model: parts.model,
                 system,
-                max_tokens,
-                max_turns: self.config.max_turns,
-                compact_at: self.config.compact_at,
+                max_tokens: parts.max_tokens,
+                // 轮次上限来自设置；`AgentConfig.max_turns` 只在嵌入方
+                // 显式指定时覆盖它（场景测试用 1 轮那种）。
+                max_turns: self.config.max_turns.unwrap_or(parts.max_turns),
+                // 阈值来自设置里的「上下文上限」；`compact_at` 只在嵌入方
+                // 显式指定时覆盖它（测试用 120 那种小阈值）。
+                compact_at: Some(self.config.compact_at.unwrap_or(parts.context_tokens)),
                 compact_keep: self.config.compact_keep,
+                compact_keep_tokens: self.config.compact_keep_tokens,
+                compact_summary: self.config.compact_summary,
+                summary_max_tokens: self.config.summary_max_tokens,
                 skills_root,
             },
-        );
+        )
+    }
+
+    /// 跑一轮对话。进度只从 `events` 出去，历史只从 `session` 出来。
+    pub async fn chat(&self, prompt: &str, events: &EventSink) -> Result<Outcome> {
+        // 先把 provider 与各项额度取出来再放开锁：整轮对话可能跑几分钟，
+        // 期间不该阻塞用户去改配置。
+        let parts = self.agent_parts();
+
+        let agent = self.build_agent(parts);
 
         let cancel = Cancellation::new();
         if let Ok(mut slot) = self.current_cancel.lock() {
@@ -1166,23 +1223,48 @@ impl AgentService {
         outcome
     }
 
+    /// 按需压缩（对应 `/compact`）。不消耗轮次，也不改动当前提问。
+    ///
+    /// 忙的时候直接拒绝而不是排队：排队会让用户以为压完了、其实还没开始，
+    /// 而压缩会重写历史——顺序搞错比干脆拒绝更糟。
+    pub async fn compact(&self, events: &EventSink) -> Result<Option<CompactReport>> {
+        let agent = self.build_agent(self.agent_parts());
+
+        // 复用 `current_cancel`：它同时是"忙不忙"的唯一判据（与 chat 一致）。
+        let cancel = Cancellation::new();
+        match self.current_cancel.lock() {
+            Ok(mut slot) if slot.is_none() => *slot = Some(cancel.clone()),
+            _ => return Err(Error::Session("压缩暂不可用：正在执行一轮对话".into())),
+        }
+
+        let mut session = self.session.lock().await;
+        let report = agent.compact_now(&mut session, events, &cancel).await;
+
+        if let Ok(mut slot) = self.current_cancel.lock() {
+            *slot = None;
+        }
+
+        // 只有真的动过历史才落盘：压缩失败时原文件不该被重写一遍。
+        if report.is_some() {
+            self.persist_locked(&session).await?;
+        }
+        Ok(report)
+    }
+
     /// 取当前 provider、模型名与输出额度。锁中毒时继续用里面的值——
     /// 这里没有"一半写坏"的可能：runtime 是整份替换的。
-    fn agent_parts(&self) -> (Arc<dyn Provider>, String, u32) {
-        match self.provider.read() {
-            Ok(runtime) => (
-                Arc::clone(&runtime.provider),
-                runtime.model.clone(),
-                runtime.max_tokens,
-            ),
-            Err(poisoned) => {
-                let runtime = poisoned.into_inner();
-                (
-                    Arc::clone(&runtime.provider),
-                    runtime.model.clone(),
-                    runtime.max_tokens,
-                )
-            }
+    fn agent_parts(&self) -> RunParts {
+        let runtime = match self.provider.read() {
+            Ok(runtime) => runtime,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        RunParts {
+            provider: Arc::clone(&runtime.provider),
+            model: runtime.model.clone(),
+            max_tokens: runtime.max_tokens,
+            context_tokens: runtime.config.context_tokens,
+            max_turns: runtime.config.max_turns,
         }
     }
 }
@@ -1282,5 +1364,50 @@ mod skill_prompt_tests {
         assert!(out.len() <= skill::MAX_PROMPT_BYTES + 512, "清单不能无限长");
         assert!(out.contains("因清单长度上限未列出"), "{out}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod run_parts_tests {
+    use super::*;
+
+    fn service_with(config: AgentConfig) -> AgentService {
+        AgentService::new(config, Arc::new(MockProvider::default()))
+    }
+
+    fn parts(max_turns: u32, context_tokens: usize) -> RunParts {
+        RunParts {
+            provider: Arc::new(MockProvider::default()),
+            model: "m".into(),
+            max_tokens: 4096,
+            context_tokens,
+            max_turns,
+        }
+    }
+
+    /// 设置里的两项额度必须真的进到循环配置里。
+    ///
+    /// 锁的是 `build_agent` 里那两行 `unwrap_or`：把字段接错、或者改回写死常量，
+    /// 表现都是"设置页改了、实际没生效"——这比不给设置项更糟。
+    #[test]
+    fn quotas_come_from_settings() {
+        let service = service_with(AgentConfig::new(std::env::temp_dir()));
+        let agent = service.build_agent(parts(37, 250_000));
+
+        assert_eq!(agent.config().max_turns, 37);
+        assert_eq!(agent.config().compact_at, Some(250_000));
+    }
+
+    /// 嵌入方显式给的值优先——场景测试用 1 轮、120 token 就是靠这条。
+    #[test]
+    fn explicit_config_overrides_settings() {
+        let mut config = AgentConfig::new(std::env::temp_dir());
+        config.max_turns = Some(3);
+        config.compact_at = Some(120);
+
+        let agent = service_with(config).build_agent(parts(37, 250_000));
+
+        assert_eq!(agent.config().max_turns, 3);
+        assert_eq!(agent.config().compact_at, Some(120));
     }
 }

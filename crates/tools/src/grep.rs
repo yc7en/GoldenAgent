@@ -32,7 +32,8 @@ impl Tool for Grep {
                     "path": { "type": "string", "description": "从哪个目录或文件开始搜，默认工作区根" },
                     "glob": { "type": "string", "description": "只搜文件名匹配这个模式的文件，如 *.rs 或 **/*.md" },
                     "ignore_case": { "type": "boolean", "description": "是否忽略大小写，默认 false" },
-                    "max_hits": { "type": "integer", "description": "最多返回多少处命中，默认 200" }
+                    "max_hits": { "type": "integer", "description": "最多返回多少处命中，默认 200" },
+                    "summary": { "type": "string", "description": "简要操作意图（4-8字），如'查找预览组件代码'" }
                 },
                 "required": ["pattern"]
             }),

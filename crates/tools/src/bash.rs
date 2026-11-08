@@ -30,7 +30,8 @@ impl Tool for Bash {
                 "properties": {
                     "command": { "type": "string", "description": "要执行的命令，Windows 走 cmd /C，其他平台走 sh -c" },
                     "cwd": { "type": "string", "description": "工作目录（相对工作区），默认工作区根" },
-                    "timeout_secs": { "type": "integer", "description": "超时秒数，默认 120，最大 600" }
+                    "timeout_secs": { "type": "integer", "description": "超时秒数，默认 120，最大 600" },
+                    "summary": { "type": "string", "description": "简要操作意图（4-8字），如'运行构建脚本'" }
                 },
                 "required": ["command"]
             }),
