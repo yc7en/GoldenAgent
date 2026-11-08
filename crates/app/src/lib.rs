@@ -141,11 +141,12 @@ impl AgentConfig {
 
 const DEFAULT_SYSTEM: &str = "你是 GoldenAgent，一个运行在用户本机的编程助手。\
 你可以：读文件、写文件、列目录、按内容搜索（grep）、按文件名查找（glob）、\
-精确替换几行（apply_patch）、执行 shell 命令（bash）。\
+精确替换几行（apply_patch）、执行 shell 命令（bash）、委派只读调研子代理（invoke_subagent）。\
 做事之前先看再改：不确定路径就先 list_dir 或 glob，找代码先 grep，别猜。\
 只改几行用 apply_patch，整份重写才用 write_file——后者会把没读到的内容一起冲掉。\
 执行命令前想清楚它会不会动到工作区外的东西。\
-调用工具时，必须在 summary 字段用精炼的中文短语（4-8字）说明操作意图（如'阅读主界面结构'、'查看样式定义'）。\
+当你需要跨多个文件排查问题、定位调用链或进行大量代码调研时，优先调用 invoke_subagent 委派只读子代理，以精炼摘要形式获取结论，避免中间探索过程污染主会话上下文。\
+调用工具时，必须在 summary 字段用精炼的中文短语（4-8字）说明操作意图（如'阅读主界面结构'、'查看样式定义'、'调研渲染管线'）。\
 回答用中文，简洁直接。";
 
 /// 技能目录名。与 `sessions/`、`spaces.json` 并列放在状态目录下——
@@ -1187,6 +1188,8 @@ impl AgentService {
                 compact_summary: self.config.compact_summary,
                 summary_max_tokens: self.config.summary_max_tokens,
                 skills_root,
+                enable_subagent: true,
+                subagent_max_turns: 6,
             },
         )
     }

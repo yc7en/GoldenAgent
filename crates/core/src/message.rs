@@ -82,4 +82,14 @@ impl Message {
             })
             .collect()
     }
+
+    pub fn get_tool_results(&self) -> Vec<ToolResult> {
+        self.blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult(res) => Some(res.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 }

@@ -310,7 +310,9 @@ fn kinds(events: &[Event]) -> Vec<&'static str> {
             Event::ToolStarted { .. } => "tool_started",
             Event::ToolFinished { .. } => "tool_finished",
             Event::PermissionRequested { .. } => "permission_requested",
+            Event::CompactionStarted { .. } => "compaction_started",
             Event::ContextCompacted { .. } => "context_compacted",
+            Event::CompactionFailed { .. } => "compaction_failed",
             Event::TurnFinished { .. } => "turn_finished",
             Event::Finished { .. } => "finished",
             Event::Error { .. } => "error",
@@ -507,7 +509,7 @@ async fn scenario_max_turns() {
         .build()
         .unwrap();
     let mut config = AgentConfig::new(&ws.path).with_mode(Mode::ReadOnly);
-    config.max_turns = 1;
+    config.max_turns = Some(1);
     let service = AgentService::new(config, provider);
 
     let (events, outcome) = run(&service, "一直读").await;
@@ -548,6 +550,9 @@ async fn scenario_context_compaction() {
         .with_session_dir(&session_dir);
     config.compact_at = Some(120);
     config.compact_keep = 4;
+    // 本场景验的是"压缩发生过、且本轮照常完成"，摘要路径由 service 用例覆盖；
+    // 开着摘要会把假厂商那一条脚本回复吃掉。
+    config.compact_summary = false;
     let service = AgentService::new(config, provider);
 
     assert!(service.restore().await.unwrap());
@@ -887,4 +892,93 @@ async fn scenario_skill_is_listed_then_read_on_demand() {
         results[0].1.contains("第一步：只提取文本"),
         "工具没读到正文: {results:?}"
     );
+}
+
+/// 场景 11（B20）：主 Agent 委派只读子代理，子代理在独立瞬时上下文中完成搜索并蒸馏回传。
+///
+/// 契约断言：
+/// 1. 主 Agent 成功触发 invoke_subagent；
+/// 2. 子代理使用独立的内存会话探索，子代理产生的中间工具（如 read_file）与事件不污染主会话；
+/// 3. 主 Agent 仅收到包含结论摘要的单一 ToolResult，并据此给出最终回复；
+/// 4. 主会话历史中严格保持 4 条消息（User -> Assistant(invoke_subagent) -> ToolResult -> Assistant），高信噪比。
+#[tokio::test]
+async fn scenario_subagent_researches_code_and_distills_result() {
+    let ws = Workspace::new();
+    ws.write("nested/config.toml", "server_port = 8080\nenable_tls = true\n");
+
+    let vendor = Vendor::start(vec![
+        // 1. 主 Agent 第 1 轮：识别出需要深入排查配置，委派只读调研子代理
+        Reply::Sse(tool_frames(&[(
+            "call_sub_1",
+            "invoke_subagent",
+            r#"{"role":"config_auditor","prompt":"排查 nested/config.toml 中的端口号与 TLS 开关","summary":"审计服务配置"}"#,
+        )])),
+        // 2. 子代理第 1 轮：在独立临时会话中调用 read_file 读取文件
+        Reply::Sse(tool_frames(&[(
+            "call_read_1",
+            "read_file",
+            r#"{"path":"nested/config.toml"}"#,
+        )])),
+        // 3. 子代理第 2 轮：分析文件内容，输出最终蒸馏结论
+        Reply::Sse(text_frames(&[
+            "调研结论：服务端口配置为 8080，TLS 加密处于启用状态 (true)。",
+        ])),
+        // 4. 主 Agent 第 2 轮：收到子代理蒸馏摘要，向用户给出最终回答
+        Reply::Sse(text_frames(&[
+            "根据审计子代理的汇报，端口为 8080，TLS 已启用。",
+        ])),
+    ])
+    .await;
+
+    let service = service(&ws, &vendor, Mode::ReadOnly);
+    let (events, outcome) = run(&service, "帮我排查一下服务配置").await;
+    assert_eq!(outcome.unwrap(), Outcome::Completed { turns: 2 });
+
+    // 验证事件流：主事件流只包含 invoke_subagent，绝不包含子代理内部的 read_file
+    let event_kinds = kinds(&events);
+    assert_eq!(
+        event_kinds,
+        vec![
+            "turn_started",
+            "tool_started",
+            "tool_finished",
+            "turn_finished",
+            "turn_started",
+            "text_delta",
+            "turn_finished",
+            "finished"
+        ],
+        "主事件流中不能泄露子代理内部的 read_file 事件"
+    );
+
+    let results = tool_results(&events);
+    assert_eq!(results.len(), 1);
+    assert!(results[0].0, "invoke_subagent 必须成功: {:?}", results[0]);
+    assert!(
+        results[0].1.contains("服务端口配置为 8080"),
+        "工具结果中必须包含子代理蒸馏摘要: {}",
+        results[0].1
+    );
+
+    // 验证历史记录（高信噪比）：主历史绝无子代理内部的只读日志
+    let history = service.history().await;
+    assert_eq!(
+        history.len(),
+        4,
+        "主会话必须严格只有 4 条消息，绝不被子代理中间步骤污染"
+    );
+
+    // 确认第 2 条是主 Agent 调用 invoke_subagent
+    let calls = history[1].tool_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].name, "invoke_subagent");
+
+    // 确认第 3 条是 invoke_subagent 的蒸馏结果
+    let res = history[2].get_tool_results();
+    assert_eq!(res.len(), 1);
+    assert_eq!(res[0].id, "call_sub_1");
+    assert!(res[0].output.contains("服务端口配置为 8080"));
+
+    // 确认最终回答
+    assert!(history[3].text().contains("根据审计子代理的汇报"));
 }

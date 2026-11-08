@@ -11,6 +11,8 @@
 
 pub mod approver;
 pub mod cancel;
+pub mod compaction;
+pub mod subagent;
 
 pub use approver::{ApprovalRequest, Approver, AutoAllow, AutoDeny};
 pub use cancel::Cancellation;
@@ -83,13 +85,28 @@ pub struct Config {
     pub max_turns: u32,
     /// token 上限阈值。`None` 表示关闭上下文压缩。
     pub compact_at: Option<usize>,
-    /// 压缩后保留的消息条数。
+    /// 压缩时**至少**保留的消息条数（下限，不是全部）。
     pub compact_keep: usize,
+    /// 压缩时保留的 token 预算。`None` = 取 `compact_at / 4`。
+    ///
+    /// 按预算而不是条数，是因为一条 1 MiB 的工具结果和一条 `收到` 不该按同一条算。
+    pub compact_keep_tokens: Option<usize>,
+    /// 是否用模型写摘要。`false` = 退回老行为（直接丢弃）。
+    ///
+    /// 摘要要多花一次模型调用，所以嵌入方可以关掉；产品默认开着。
+    pub compact_summary: bool,
+    /// 摘要单次输出的 token 上限。推理模型的思考也算在里面。
+    pub summary_max_tokens: u32,
     /// 技能根目录。`None` 表示这台机器没启用技能，`use_skill` 会明确报错。
     ///
     /// 它是**只读资产**，与工作区是两回事：不进 `Policy::roots()`，
     /// 也不参与相对路径解析（见 ARCHITECTURE A-14）。
     pub skills_root: Option<std::path::PathBuf>,
+    /// 是否挂载只读子代理工具（B20）。默认为 true。
+    /// 子代理自身递归实例化循环时设为 false，杜绝套娃。
+    pub enable_subagent: bool,
+    /// 子代理最多跑几轮，默认 6 轮。
+    pub subagent_max_turns: u32,
 }
 
 impl Default for Config {
@@ -101,7 +118,12 @@ impl Default for Config {
             max_turns: 12,
             compact_at: None,
             compact_keep: 8,
+            compact_keep_tokens: None,
+            compact_summary: true,
+            summary_max_tokens: 2048,
             skills_root: None,
+            enable_subagent: true,
+            subagent_max_turns: subagent::DEFAULT_SUBAGENT_MAX_TURNS,
         }
     }
 }
@@ -143,6 +165,24 @@ impl AgentLoop {
         if let Some(skills) = config.skills_root.clone() {
             ctx = ctx.with_skills_root(skills);
         }
+
+        // B20: 当开启子代理且尚未挂载 invoke_subagent 时，自动挂载只读子代理工具。
+        // 子代理内部循环通过 enable_subagent = false 实例化，严格防止套娃。
+        let tools = if config.enable_subagent && !tools.contains("invoke_subagent") {
+            let read_only_tools = Arc::new(tools.read_only().without("invoke_subagent"));
+            let subagent_tool = Arc::new(subagent::InvokeSubagent::new(
+                Arc::clone(&provider),
+                read_only_tools,
+                config.model.clone(),
+                config.subagent_max_turns,
+            ));
+            let mut full = (*tools).clone();
+            full.register(subagent_tool);
+            Arc::new(full)
+        } else {
+            tools
+        };
+
         Self {
             provider,
             tools,
@@ -150,6 +190,10 @@ impl AgentLoop {
             ctx,
             config,
         }
+    }
+
+    pub fn tools(&self) -> &Registry {
+        &self.tools
     }
 
     pub fn config(&self) -> &Config {
@@ -179,7 +223,9 @@ impl AgentLoop {
                 return Ok(Outcome::Cancelled);
             }
 
-            self.maybe_compact(session, events);
+            // 压缩要额外调一次模型写摘要，所以是异步的。
+            // 它自己把失败消化成事件，不会让本轮中断。
+            compaction::auto(&self.provider, &self.config, session, events, cancel).await;
 
             events.send(Event::TurnStarted { turn });
 
@@ -382,9 +428,12 @@ impl AgentLoop {
         }
 
         self.emit_started(events, &call);
-        let (ok, output) = match self.tools.run(&call.name, call.input.clone(), &self.ctx).await {
-            Ok(output) => (true, output),
-            Err(error) => (false, error.to_string()),
+        let (ok, output) = tokio::select! {
+            res = self.tools.run(&call.name, call.input.clone(), &self.ctx) => match res {
+                Ok(output) => (true, output),
+                Err(error) => (false, error.to_string()),
+            },
+            _ = cancel.cancelled() => (false, "已取消".to_string()),
         };
         self.emit_finished(events, &call.id, &call.name, ok, &output);
 
@@ -413,17 +462,13 @@ impl AgentLoop {
     }
 
     /// 压缩历史。任何丢弃历史的行为都必须发事件（ARCHITECTURE §4）。
-    fn maybe_compact(&self, session: &mut Session, events: &EventSink) {
-        let Some(limit) = self.config.compact_at else {
-            return;
-        };
-        if session.estimate_tokens() <= limit {
-            return;
-        }
-        let removed = session.compact(self.config.compact_keep);
-        if removed > 0 {
-            events.send(Event::ContextCompacted { removed });
-        }
+    pub async fn compact_now(
+        &self,
+        session: &mut Session,
+        events: &EventSink,
+        cancel: &Cancellation,
+    ) -> Option<compaction::Report> {
+        compaction::forced(&self.provider, &self.config, session, events, cancel).await
     }
 }
 

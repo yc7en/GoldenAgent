@@ -85,7 +85,7 @@ impl ToolContext {
 }
 
 /// 取必填的字符串参数。少参数是最常见的模型犯错，报错要写清缺哪个字段。
-pub(crate) fn required_str<'a>(input: &'a serde_json::Value, key: &str) -> Result<&'a str> {
+pub fn required_str<'a>(input: &'a serde_json::Value, key: &str) -> Result<&'a str> {
     input
         .get(key)
         .and_then(serde_json::Value::as_str)
@@ -100,7 +100,7 @@ pub trait Tool: Send + Sync {
     async fn run(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<String>;
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Registry {
     tools: Vec<Arc<dyn Tool>>,
 }
@@ -126,6 +126,33 @@ impl Registry {
         registry.register(Arc::new(apply_patch::ApplyPatch));
         registry.register(Arc::new(bash::Bash));
         registry
+    }
+
+    /// 过滤仅保留只读工具（ToolKind::Read）。
+    pub fn read_only(&self) -> Self {
+        let tools = self
+            .tools
+            .iter()
+            .filter(|t| t.spec().kind == goldenagent_core::ToolKind::Read)
+            .cloned()
+            .collect();
+        Self { tools }
+    }
+
+    /// 过滤排除指定名称的工具。
+    pub fn without(&self, name: &str) -> Self {
+        let tools = self
+            .tools
+            .iter()
+            .filter(|t| t.spec().name != name)
+            .cloned()
+            .collect();
+        Self { tools }
+    }
+
+    /// 检查是否已包含指定名称的工具。
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools.iter().any(|t| t.spec().name == name)
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
