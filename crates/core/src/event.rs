@@ -49,14 +49,40 @@ pub enum Event {
         name: String,
         summary: String,
     },
+    /// 压缩要额外调一次模型写摘要，可能几秒到几十秒。
+    ///
+    /// 单独发一个"开始"事件，是为了让界面在这段时间里有东西可显示——
+    /// 否则用户只会看到界面卡住，然后突然跳一条"已压缩"。
+    CompactionStarted {
+        estimated_tokens: usize,
+    },
     ContextCompacted {
         removed: usize,
+    },
+    /// 压缩没成功。
+    ///
+    /// **历史仍然会被收拾，但摘要没生成**——所以这条事件不是"什么都没发生"，
+    /// 而是"发生了，但降级了"。静默降级比报错更让人摸不着头脑，这条是刻意做的。
+    CompactionFailed {
+        reason: String,
     },
     TurnFinished {
         turn: u32,
     },
     Finished {
         reason: StopReason,
+    },
+    /// 后台长耗时任务启动（B21）。
+    TaskStarted {
+        id: String,
+        kind: String,
+        description: String,
+    },
+    /// 后台长耗时任务执行完毕（B21）。
+    TaskCompleted {
+        id: String,
+        ok: bool,
+        output: String,
     },
     Error {
         message: String,
@@ -105,13 +131,39 @@ mod tests {
                 json!({"type": "permission_requested", "id": "c1", "name": "write_file", "summary": "写 a.txt"}),
             ),
             (
+                Event::CompactionStarted {
+                    estimated_tokens: 52000,
+                },
+                json!({"type": "compaction_started", "estimated_tokens": 52000}),
+            ),
+            (
                 Event::ContextCompacted { removed: 4 },
                 json!({"type": "context_compacted", "removed": 4}),
+            ),
+            (
+                Event::CompactionFailed { reason: "摘要为空".into() },
+                json!({"type": "compaction_failed", "reason": "摘要为空"}),
             ),
             (Event::TurnFinished { turn: 1 }, json!({"type": "turn_finished", "turn": 1})),
             (
                 Event::Finished { reason: StopReason::MaxTurns },
                 json!({"type": "finished", "reason": "max_turns"}),
+            ),
+            (
+                Event::TaskStarted {
+                    id: "t1".into(),
+                    kind: "bash".into(),
+                    description: "cargo build".into(),
+                },
+                json!({"type": "task_started", "id": "t1", "kind": "bash", "description": "cargo build"}),
+            ),
+            (
+                Event::TaskCompleted {
+                    id: "t1".into(),
+                    ok: true,
+                    output: "ok".into(),
+                },
+                json!({"type": "task_completed", "id": "t1", "ok": true, "output": "ok"}),
             ),
             (Event::Error { message: "boom".into() }, json!({"type": "error", "message": "boom"})),
         ];

@@ -185,3 +185,37 @@ fn agent_loop_automatically_registers_subagent_tool() {
         "默认配置的 AgentLoop 必须包含 invoke_subagent 工具"
     );
 }
+
+#[tokio::test]
+async fn subagent_background_spawn_returns_task_id() {
+    let ws = Workspace::new();
+    std::fs::write(ws.path.join("a.txt"), "hello").unwrap();
+
+    let provider = Arc::new(MockProvider::new(vec![
+        call("c1", "read_file", json!({ "path": "a.txt" })),
+        text("后台子代理分析完成：a.txt 内容正常。"),
+    ]));
+
+    let defaults = Registry::with_defaults();
+    let read_only = Arc::new(defaults.read_only());
+    let subagent = InvokeSubagent::new(provider, read_only, "mock-model".into(), 4);
+
+    let ctx = ToolContext::new(&ws.path);
+    let input = json!({
+        "role": "async_researcher",
+        "prompt": "后台排查 a.txt",
+        "background": true
+    });
+
+    let result = subagent.run(input, &ctx).await.expect("派发后台必须成功");
+    assert!(result.contains("后台子代理调研已启动 (TaskId: task_"));
+
+    // 等待后台子代理协程跑完
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let list = ctx.tasks.list();
+    assert!(!list.is_empty());
+    let task = list.last().unwrap();
+    assert_eq!(task.status, goldenagent_core::TaskStatus::Completed);
+    assert!(task.output.as_ref().unwrap().contains("后台子代理分析完成"));
+}

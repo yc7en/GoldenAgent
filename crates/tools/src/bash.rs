@@ -31,6 +31,7 @@ impl Tool for Bash {
                     "command": { "type": "string", "description": "要执行的命令，Windows 走 cmd /C，其他平台走 sh -c" },
                     "cwd": { "type": "string", "description": "工作目录（相对工作区），默认工作区根" },
                     "timeout_secs": { "type": "integer", "description": "超时秒数，默认 120，最大 600" },
+                    "background": { "type": "boolean", "description": "是否放入后台作为独立作业运行，默认 false。长耗时编译或守护进程请设为 true，立即返回 task_id，不阻塞主会话" },
                     "summary": { "type": "string", "description": "简要操作意图（4-8字），如'运行构建脚本'" }
                 },
                 "required": ["command"]
@@ -55,6 +56,32 @@ impl Tool for Bash {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS);
 
+        let background = input
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        if background {
+            let cmd_str = command.to_string();
+            let cmd_for_fut = cmd_str.clone();
+            let cwd_path = cwd.clone();
+            let task_id = ctx.tasks.spawn("bash", &cmd_str, async move {
+                execute_command(&cmd_for_fut, &cwd_path, timeout_secs).await
+            });
+            return Ok(format!(
+                "后台任务已启动 (TaskId: {task_id})。\n命令: {command}\n任务正在后台独立运行，不会阻塞主会话。你可以使用 manage_task 查询进度或取消。"
+            ));
+        }
+
+        execute_command(command, &cwd, timeout_secs).await
+    }
+}
+
+async fn execute_command(
+    command: &str,
+    cwd: &std::path::Path,
+    timeout_secs: u64,
+) -> Result<String> {
         let mut builder = shell_command(command);
         builder
             .current_dir(&cwd)
@@ -135,7 +162,6 @@ impl Tool for Bash {
             ));
         }
         Ok(out)
-    }
 }
 
 /// 杀掉整棵进程树。

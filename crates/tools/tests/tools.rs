@@ -218,6 +218,7 @@ fn default_registry_exposes_all_tools() {
             "glob",
             "grep",
             "list_dir",
+            "manage_task",
             "read_file",
             "use_skill",
             "write_file"
@@ -226,7 +227,7 @@ fn default_registry_exposes_all_tools() {
 
     // policy 靠 kind 判断，不靠工具名——这里锁死每个工具的 kind。
     let reg = registry();
-    for name in ["read_file", "list_dir", "grep", "glob", "use_skill"] {
+    for name in ["read_file", "list_dir", "grep", "glob", "use_skill", "manage_task"] {
         assert_eq!(
             reg.spec(name).unwrap().kind,
             goldenagent_core::ToolKind::Read,

@@ -141,12 +141,13 @@ impl AgentConfig {
 
 const DEFAULT_SYSTEM: &str = "你是 GoldenAgent，一个运行在用户本机的编程助手。\
 你可以：读文件、写文件、列目录、按内容搜索（grep）、按文件名查找（glob）、\
-精确替换几行（apply_patch）、执行 shell 命令（bash）、委派只读调研子代理（invoke_subagent）。\
+精确替换几行（apply_patch）、执行 shell 命令（bash）、委派只读调研子代理（invoke_subagent）、管理后台作业系统（manage_task）。\
 做事之前先看再改：不确定路径就先 list_dir 或 glob，找代码先 grep，别猜。\
 只改几行用 apply_patch，整份重写才用 write_file——后者会把没读到的内容一起冲掉。\
 执行命令前想清楚它会不会动到工作区外的东西。\
 当你需要跨多个文件排查问题、定位调用链或进行大量代码调研时，优先调用 invoke_subagent 委派只读子代理，以精炼摘要形式获取结论，避免中间探索过程污染主会话上下文。\
-调用工具时，必须在 summary 字段用精炼的中文短语（4-8字）说明操作意图（如'阅读主界面结构'、'查看样式定义'、'调研渲染管线'）。\
+长耗时任务（如大型项目编译、全量测试、网络爬虫或复杂子代理排查）可在 bash 或 invoke_subagent 中指定 background: true 派发至后台独立运行，不阻塞主会话，并使用 manage_task 随时查看进度或终止任务。\
+调用工具时，必须在 summary 字段用精炼的中文短语（4-8字）说明操作意图（如'阅读主界面结构'、'查看样式定义'、'调研渲染管线'、'查看后台任务'）。\
 回答用中文，简洁直接。";
 
 /// 技能目录名。与 `sessions/`、`spaces.json` 并列放在状态目录下——
@@ -312,6 +313,8 @@ pub struct AgentService {
     /// 活动工作区。锁序：**active → session → session_id**，新的锁放最外层。
     active: RwLock<ActiveWorkspace>,
     approver: Arc<EventApprover>,
+    tasks: Arc<goldenagent_tools::TaskManager>,
+    task_inbox: Arc<StdMutex<Vec<goldenagent_core::TaskInfo>>>,
 }
 
 /// 一轮运行要用的装配参数。
@@ -338,6 +341,20 @@ impl AgentService {
             None => SpaceStore::new(dir),
         });
         let active = ActiveWorkspace::new(None, config.workspace.clone(), Vec::new());
+        let tasks = Arc::new(goldenagent_tools::TaskManager::new());
+        let task_inbox = Arc::new(StdMutex::new(Vec::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tasks.set_notifier(tx);
+        let inbox_clone = Arc::clone(&task_inbox);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                while let Some(info) = rx.recv().await {
+                    if let Ok(mut inbox) = inbox_clone.lock() {
+                        inbox.push(info);
+                    }
+                }
+            });
+        }
         let runtime = ProviderRuntime {
             provider,
             config: ProviderConfig::mock(),
@@ -363,12 +380,36 @@ impl AgentService {
             current_cancel: StdMutex::new(None),
             active: RwLock::new(active),
             approver,
+            tasks,
+            task_inbox,
         }
     }
 
     pub fn with_tools(mut self, tools: Registry) -> Self {
         self.tools = Arc::new(tools);
         self
+    }
+
+    /// 后台作业管理器（B21）。
+    pub fn tasks(&self) -> &goldenagent_tools::TaskManager {
+        &self.tasks
+    }
+
+    /// 响应式自主唤醒（Reactive Wakeup，A-16）。
+    /// 当后台任务在收件箱有积压产物且主服务处于空闲时，驱动 Agent 自动汇报结果。
+    pub async fn wakeup(&self, events: &EventSink) -> Result<Option<Outcome>> {
+        let has_inbox = self
+            .task_inbox
+            .lock()
+            .map(|inbox| !inbox.is_empty())
+            .unwrap_or(false);
+        if !has_inbox || self.is_busy() {
+            return Ok(None);
+        }
+        let outcome = self
+            .chat("后台任务已产生新的执行结果，请向用户汇报最新进展与结论。", events)
+            .await?;
+        Ok(Some(outcome))
     }
 
     /// 按「环境变量 → 配置文件 → 未配置」装配 provider。
@@ -1190,6 +1231,7 @@ impl AgentService {
                 skills_root,
                 enable_subagent: true,
                 subagent_max_turns: 6,
+                tasks: Some(Arc::clone(&self.tasks)),
             },
         )
     }
@@ -1208,6 +1250,26 @@ impl AgentService {
         }
 
         let mut session = self.session.lock().await;
+
+        // B21: 检查收件箱中的后台任务完成结果（A-16 忙闲协作），在用户提问前注入会话
+        let pending_tasks = if let Ok(mut inbox) = self.task_inbox.lock() {
+            std::mem::take(&mut *inbox)
+        } else {
+            Vec::new()
+        };
+
+        for task in pending_tasks {
+            let status_desc = if task.status == goldenagent_core::TaskStatus::Completed {
+                format!("已完成。输出如下：\n{}", task.output.unwrap_or_default())
+            } else {
+                format!("未成功完成。详情：\n{}", task.error.unwrap_or_default())
+            };
+            session.push_user(format!(
+                "[系统通知 · 后台任务产物回传]\n任务 ID: {}\n类型: {}\n描述: {}\n结果: {}",
+                task.id, task.kind, task.description, status_desc
+            ));
+        }
+
         let outcome = agent
             .run(&mut session, prompt, events, self.approver.as_ref(), &cancel)
             .await;

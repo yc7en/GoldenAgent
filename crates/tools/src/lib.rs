@@ -8,17 +8,19 @@
 // jail 对外可见：policy 层要复用同一套路径归一化逻辑，
 // 不允许各层各写一份"算不算在工作区内"的判定。
 pub mod jail;
+pub mod task_manager;
 
+mod apply_patch;
 mod bash;
 mod encoding;
 mod glob;
 mod grep;
 mod list_dir;
+mod manage_task;
 mod read_file;
 pub mod skill;
 mod walk;
 mod write_file;
-mod apply_patch;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,6 +32,7 @@ pub use apply_patch::MAX_EDITS;
 pub use bash::{DEFAULT_TIMEOUT_SECS, MAX_OUTPUT_BYTES, MAX_TIMEOUT_SECS};
 pub use list_dir::MAX_ENTRIES;
 pub use read_file::{DEFAULT_LIMIT, MAX_READ_BYTES};
+pub use task_manager::TaskManager;
 pub use write_file::MAX_WRITE_BYTES;
 
 #[derive(Debug, Clone)]
@@ -43,6 +46,8 @@ pub struct ToolContext {
     /// 与 `workspace` 是**两个概念**：工作区是可读写的现场，技能根是只读的说明书。
     /// 刻意不并进 `roots()`——那样 `write_file` 就写得进 skill 了（见 A-14）。
     pub skills_root: Option<PathBuf>,
+    /// 全局后台作业管理器（B21）。
+    pub tasks: Arc<TaskManager>,
 }
 
 impl ToolContext {
@@ -51,6 +56,7 @@ impl ToolContext {
             workspace: workspace.into(),
             extra_roots: Vec::new(),
             skills_root: None,
+            tasks: Arc::new(TaskManager::new()),
         }
     }
 
@@ -60,7 +66,14 @@ impl ToolContext {
             workspace: primary.into(),
             extra_roots: extra,
             skills_root: None,
+            tasks: Arc::new(TaskManager::new()),
         }
+    }
+
+    /// 挂上后台作业管理器。
+    pub fn with_tasks(mut self, tasks: Arc<TaskManager>) -> Self {
+        self.tasks = tasks;
+        self
     }
 
     /// 挂上技能根。只有 `use_skill` 会用它，路径判定仍是单根 + 白名单。
@@ -125,6 +138,7 @@ impl Registry {
         registry.register(Arc::new(glob::Glob));
         registry.register(Arc::new(apply_patch::ApplyPatch));
         registry.register(Arc::new(bash::Bash));
+        registry.register(Arc::new(manage_task::ManageTask));
         registry
     }
 

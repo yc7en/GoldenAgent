@@ -13,7 +13,7 @@ import {
 /**
  * 折叠状态下那一行摘要，按「最能说明这一步在干什么」的顺序找字段。
  */
-const DETAIL_KEYS = ["command", "path", "file_path", "pattern", "query", "url", "name", "prompt", "role"];
+const DETAIL_KEYS = ["command", "path", "file_path", "pattern", "query", "url", "name", "prompt", "role", "task_id", "action"];
 
 function oneLine(text: string): string {
   const flat = text.replace(/\s+/g, " ").trim();
@@ -73,6 +73,8 @@ function getToolDisplay(name: string, input: unknown): { summary: string; detail
       return { summary: detail ? `查阅技能 ${detail}` : "查阅技能文档", detail };
     case "invoke_subagent":
       return { summary: detail ? `委派子代理 ${detail}` : "委派只读子代理调研", detail };
+    case "manage_task":
+      return { summary: detail ? `管理后台作业 ${detail}` : "管理后台作业", detail };
     default:
       return { summary: `${name} ${detail}`.trim(), detail };
   }

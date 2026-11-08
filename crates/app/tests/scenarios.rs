@@ -315,6 +315,8 @@ fn kinds(events: &[Event]) -> Vec<&'static str> {
             Event::CompactionFailed { .. } => "compaction_failed",
             Event::TurnFinished { .. } => "turn_finished",
             Event::Finished { .. } => "finished",
+            Event::TaskStarted { .. } => "task_started",
+            Event::TaskCompleted { .. } => "task_completed",
             Event::Error { .. } => "error",
         })
         .collect()
@@ -981,4 +983,68 @@ async fn scenario_subagent_researches_code_and_distills_result() {
 
     // 确认最终回答
     assert!(history[3].text().contains("根据审计子代理的汇报"));
+}
+
+/// 场景 12（B21）：后台作业派发（Background Jobs）与响应式唤醒（Reactive Wakeup）。
+///
+/// 契约断言：
+/// 1. 模型派发后台命令（background: true），工具当场返回 TaskId，首轮立即结束并释放 busy 状态；
+/// 2. 后台任务在独立协程完成，写入 TaskManager；
+/// 3. 当服务空闲时触发 wakeup，系统自动注入任务产物并驱动模型做出总结汇报。
+#[tokio::test]
+async fn scenario_background_job_and_reactive_wakeup() {
+    let ws = Workspace::new();
+
+    let vendor = Vendor::start(vec![
+        // 1. 首轮模型调用：发起后台构建任务
+        Reply::Sse(tool_frames(&[(
+            "call_bash_1",
+            "bash",
+            r#"{"command":"echo BUILD_SUCCESS_V2","background":true,"summary":"后台构建"}"#,
+        )])),
+        // 2. 首轮模型接收到 TaskId，立即回复用户并释放主会话
+        Reply::Sse(text_frames(&[
+            "已在后台启动构建任务，您可以继续执行其他操作。",
+        ])),
+        // 3. 响应式唤醒轮次：模型收到后台任务产物通知，给出最终汇报
+        Reply::Sse(text_frames(&[
+            "刚才在后台运行的构建任务已顺利完成，产物确认为 BUILD_SUCCESS_V2。",
+        ])),
+    ])
+    .await;
+
+    let service = service(&ws, &vendor, Mode::Bypass);
+
+    // 第一轮：触发后台任务派发
+    let (events, outcome) = run(&service, "开始后台构建").await;
+    assert_eq!(outcome.unwrap(), Outcome::Completed { turns: 2 });
+    assert!(!service.is_busy(), "首轮结束后主服务必须立即释放忙碌状态");
+
+    let results = tool_results(&events);
+    assert_eq!(results.len(), 1);
+    assert!(results[0].1.contains("后台任务已启动 (TaskId: task_"));
+
+    // 等待后台命令协程执行完毕
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // 验证后台任务在 TaskManager 中记录的状态
+    let tasks = service.tasks().list();
+    assert!(!tasks.is_empty(), "任务必须登记在 TaskManager");
+    assert_eq!(tasks[0].status, goldenagent_core::TaskStatus::Completed);
+
+    // 触发响应式唤醒（Reactive Wakeup）
+    let (wakeup_sink, _rx) = EventSink::channel();
+    let wakeup_outcome = service.wakeup(&wakeup_sink).await.expect("唤醒成功");
+    assert!(wakeup_outcome.is_some(), "有未读任务产物时必须触发唤醒");
+
+    // 验证主会话历史中已被注入任务完成通知与最终回复
+    let history = service.history().await;
+    let full_history_text = history
+        .iter()
+        .map(|m| m.text())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(full_history_text.contains("后台任务产物回传"));
+    assert!(full_history_text.contains("BUILD_SUCCESS_V2"));
+    assert!(full_history_text.contains("刚才在后台运行的构建任务已顺利完成"));
 }

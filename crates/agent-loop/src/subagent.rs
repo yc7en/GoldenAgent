@@ -21,12 +21,14 @@ const SUBAGENT_SYSTEM_PROMPT: &str = "你是 GoldenAgent 的只读调研子代�
 2. 当你掌握了足够的事实、得出明确结论后，请直接输出高度提炼、结构清晰的中文总结，汇报给主 Agent；\
 3. 结论必须具体、有依有据（明确指出关键文件路径和行号/关键逻辑），但不要倾倒大段未处理的原始文件内容。";
 
-/// B20：只读调研型子代理工具。
+/// B20 & B21：只读调研型子代理工具（支持同步等待与后台异步派发）。
 ///
-/// 遵循 ARCHITECTURE A-5 与 A-15：
+/// 遵循 ARCHITECTURE A-5, A-15 与 A-16：
 /// - 复用同一个 AgentLoop 架构，非第二套引擎；
 /// - 内部使用独立的瞬时会话，繁琐搜索日志不进主会话；
-/// - 仅将最终 Assistant 回答文本蒸馏回传给主 Agent。
+/// - 仅将最终 Assistant 回答文本蒸馏回传给主 Agent；
+/// - 支持 background: true 后台独立运行，不阻塞主会话交互。
+#[derive(Clone)]
 pub struct InvokeSubagent {
     provider: Arc<dyn Provider>,
     read_only_tools: Arc<Registry>,
@@ -75,6 +77,10 @@ impl Tool for InvokeSubagent {
                     "summary": {
                         "type": "string",
                         "description": "4-8 字中文操作意图，如 '调研渲染管线'、'排查依赖版本'"
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "是否在后台独立运行，默认 false。设为 true 时立即返回 task_id，不阻塞主会话交互"
                     }
                 },
                 "required": ["role", "prompt"]
@@ -83,6 +89,31 @@ impl Tool for InvokeSubagent {
     }
 
     async fn run(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<String> {
+        let role = required_str(&input, "role")?;
+        let background = input
+            .get("background")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        if background {
+            let this = self.clone();
+            let input_clone = input.clone();
+            let ctx_clone = ctx.clone();
+            let role_desc = format!("子代理调研: {role}");
+            let task_id = ctx.tasks.spawn("subagent", &role_desc, async move {
+                this.run_sync(input_clone, &ctx_clone).await
+            });
+            return Ok(format!(
+                "后台子代理调研已启动 (TaskId: {task_id})。\n角色: {role}\n任务正在后台独立运行，不会阻塞主会话。你可以使用 manage_task 查询进度或取消。"
+            ));
+        }
+
+        self.run_sync(input, ctx).await
+    }
+}
+
+impl InvokeSubagent {
+    async fn run_sync(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let role = required_str(&input, "role")?;
         let prompt = required_str(&input, "prompt")?;
 
@@ -105,6 +136,7 @@ impl Tool for InvokeSubagent {
             skills_root: ctx.skills_root.clone(),
             enable_subagent: false, // 严格禁止递归创建子代理
             subagent_max_turns: 0,
+            tasks: Some(Arc::clone(&ctx.tasks)),
         };
 
         let sub_agent = AgentLoop::new(

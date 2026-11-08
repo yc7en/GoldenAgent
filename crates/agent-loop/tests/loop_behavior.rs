@@ -100,9 +100,13 @@ fn shape(events: &[Event]) -> Vec<&'static str> {
             Event::ToolStarted { .. } => "tool_started",
             Event::ToolFinished { .. } => "tool_finished",
             Event::PermissionRequested { .. } => "permission_requested",
+            Event::CompactionStarted { .. } => "compaction_started",
             Event::ContextCompacted { .. } => "context_compacted",
+            Event::CompactionFailed { .. } => "compaction_failed",
             Event::TurnFinished { .. } => "turn_finished",
             Event::Finished { .. } => "finished",
+            Event::TaskStarted { .. } => "task_started",
+            Event::TaskCompleted { .. } => "task_completed",
             Event::Error { .. } => "error",
         })
         .collect()
@@ -542,11 +546,15 @@ async fn pre_cancelled_run_does_nothing() {
 #[tokio::test]
 async fn compaction_is_announced() {
     let ws = Workspace::new();
+    let mut config = Config::default().with_compaction(20, 2);
+    // 这条用例只验"压缩被宣告、且发生在请求之前"，摘要路径单独验。
+    config.compact_summary = false;
+
     let agent = build(
         Arc::new(MockProvider::new(vec![text("好")])),
         &ws,
         Mode::ReadOnly,
-        Config::default().with_compaction(20, 2),
+        config,
     );
     let (sink, mut rx) = EventSink::channel();
 
@@ -570,8 +578,103 @@ async fn compaction_is_announced() {
         })
         .expect("必须发 ContextCompacted");
     assert!(removed > 0);
-    assert_eq!(shape(&events)[0], "context_compacted", "压缩要在本轮请求之前");
-    assert!(session.len() <= 3, "压缩后应只剩最近几条 + 本轮提问");
+
+    // 顺序：先宣告"要压缩了"，再报结果，最后才是本轮请求。
+    let shape = shape(&events);
+    assert_eq!(shape[0], "compaction_started", "要先有开始");
+    assert_eq!(shape[1], "context_compacted", "再报结果");
+    assert_eq!(shape[2], "turn_started", "压缩要在本轮请求之前");
+    // 保留的 2 条 + 1 条检查点 + 本轮回答 = 4
+    assert!(session.len() <= 4, "压缩后应只剩最近几条 + 检查点 + 本轮问答");
+}
+
+/// 摘要路径：模型写了摘要，历史被换成一份带 `<compacted-summary>` 的检查点。
+#[tokio::test]
+async fn compaction_replaces_history_with_a_summary() {
+    let ws = Workspace::new();
+    let summary = "## 用户的原始需求\n- 让循环能跑通\n\n## 下一步\n- 继续";
+
+    let agent = build(
+        Arc::new(MockProvider::new(vec![text(summary), text("好")])),
+        &ws,
+        Mode::ReadOnly,
+        Config::default().with_compaction(20, 2),
+    );
+    let (sink, mut rx) = EventSink::channel();
+
+    let mut session = Session::new();
+    for i in 0..8 {
+        session.push_user(format!("历史消息 {i}，内容足够长以触发阈值判断"));
+        session.push(text("收到"));
+    }
+
+    agent
+        .run(&mut session, "现在开始", &sink, &FixedApprover::new(true), &Cancellation::new())
+        .await
+        .unwrap();
+
+    let events = drain(&mut rx);
+    assert!(
+        events.iter().any(|e| matches!(e, Event::ContextCompacted { .. })),
+        "摘要成功也要报压缩结果"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::CompactionFailed { .. })),
+        "摘要成功不该报失败"
+    );
+
+    let head = session.messages()[0].text();
+    assert!(head.contains("<compacted-summary>"), "{head}");
+    assert!(head.contains("让循环能跑通"), "摘要正文要在检查点里");
+    assert!(
+        head.contains("不要提起这个检查点"),
+        "前导要告诉模型别复述"
+    );
+}
+
+/// 摘要返回空 → 降级为丢弃，但必须明说，不能静默。
+#[tokio::test]
+async fn empty_summary_falls_back_loudly() {
+    let ws = Workspace::new();
+    let agent = build(
+        Arc::new(MockProvider::new(vec![
+            Message::assistant(vec![]),
+            text("好"),
+        ])),
+        &ws,
+        Mode::ReadOnly,
+        Config::default().with_compaction(20, 2),
+    );
+    let (sink, mut rx) = EventSink::channel();
+
+    let mut session = Session::new();
+    for i in 0..8 {
+        session.push_user(format!("历史消息 {i}，内容足够长以触发阈值判断"));
+        session.push(text("收到"));
+    }
+
+    agent
+        .run(&mut session, "现在开始", &sink, &FixedApprover::new(true), &Cancellation::new())
+        .await
+        .unwrap();
+
+    let events = drain(&mut rx);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::CompactionFailed { .. })),
+        "摘要失败必须发 CompactionFailed"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, Event::ContextCompacted { .. })),
+        "降级截断仍然要报历史被处理过"
+    );
+
+    let head = session.messages()[0].text();
+    assert!(head.contains("未能生成摘要"), "模型要知道摘要没生成：{head}");
+    assert!(!head.contains("<compacted-summary>"), "没有摘要就不要假装有");
 }
 
 #[tokio::test]

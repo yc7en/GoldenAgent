@@ -107,6 +107,8 @@ pub struct Config {
     pub enable_subagent: bool,
     /// 子代理最多跑几轮，默认 6 轮。
     pub subagent_max_turns: u32,
+    /// 全局后台作业管理器（B21）。`None` 时使用独立实例。
+    pub tasks: Option<Arc<goldenagent_tools::TaskManager>>,
 }
 
 impl Default for Config {
@@ -124,6 +126,7 @@ impl Default for Config {
             skills_root: None,
             enable_subagent: true,
             subagent_max_turns: subagent::DEFAULT_SUBAGENT_MAX_TURNS,
+            tasks: None,
         }
     }
 }
@@ -164,6 +167,10 @@ impl AgentLoop {
         // 技能根单独挂：它不是工作区，不进 policy 的根集合（A-14）。
         if let Some(skills) = config.skills_root.clone() {
             ctx = ctx.with_skills_root(skills);
+        }
+        // 后台作业管理器（B21）。
+        if let Some(tasks) = config.tasks.clone() {
+            ctx = ctx.with_tasks(tasks);
         }
 
         // B20: 当开启子代理且尚未挂载 invoke_subagent 时，自动挂载只读子代理工具。
