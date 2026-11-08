@@ -137,6 +137,7 @@ impl InvokeSubagent {
             enable_subagent: false, // 严格禁止递归创建子代理
             subagent_max_turns: 0,
             tasks: Some(Arc::clone(&ctx.tasks)),
+            terminals: Some(Arc::clone(&ctx.terminals)),
         };
 
         let sub_agent = AgentLoop::new(

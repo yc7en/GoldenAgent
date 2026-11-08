@@ -13,7 +13,7 @@ import {
 /**
  * 折叠状态下那一行摘要，按「最能说明这一步在干什么」的顺序找字段。
  */
-const DETAIL_KEYS = ["command", "path", "file_path", "pattern", "query", "url", "name", "prompt", "role", "task_id", "action"];
+const DETAIL_KEYS = ["command", "input", "path", "file_path", "pattern", "query", "url", "name", "prompt", "role", "task_id", "terminal_id", "action"];
 
 function oneLine(text: string): string {
   const flat = text.replace(/\s+/g, " ").trim();
@@ -75,6 +75,14 @@ function getToolDisplay(name: string, input: unknown): { summary: string; detail
       return { summary: detail ? `委派子代理 ${detail}` : "委派只读子代理调研", detail };
     case "manage_task":
       return { summary: detail ? `管理后台作业 ${detail}` : "管理后台作业", detail };
+    case "terminal_create":
+      return { summary: detail ? `创建终端 ${detail}` : "创建有状态终端", detail };
+    case "terminal_write":
+      return { summary: detail ? `输入 ${detail}` : "向终端写入指令", detail };
+    case "terminal_read":
+      return { summary: detail ? `读取 ${detail}` : "读取终端屏幕增量", detail };
+    case "terminal_kill":
+      return { summary: detail ? `关闭终端 ${detail}` : "终止终端会话", detail };
     default:
       return { summary: `${name} ${detail}`.trim(), detail };
   }

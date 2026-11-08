@@ -220,6 +220,10 @@ fn default_registry_exposes_all_tools() {
             "list_dir",
             "manage_task",
             "read_file",
+            "terminal_create",
+            "terminal_kill",
+            "terminal_read",
+            "terminal_write",
             "use_skill",
             "write_file"
         ]
@@ -227,7 +231,15 @@ fn default_registry_exposes_all_tools() {
 
     // policy 靠 kind 判断，不靠工具名——这里锁死每个工具的 kind。
     let reg = registry();
-    for name in ["read_file", "list_dir", "grep", "glob", "use_skill", "manage_task"] {
+    for name in [
+        "read_file",
+        "list_dir",
+        "grep",
+        "glob",
+        "use_skill",
+        "manage_task",
+        "terminal_read",
+    ] {
         assert_eq!(
             reg.spec(name).unwrap().kind,
             goldenagent_core::ToolKind::Read,
@@ -241,11 +253,13 @@ fn default_registry_exposes_all_tools() {
             "{name} 应是写类"
         );
     }
-    assert_eq!(
-        reg.spec("bash").unwrap().kind,
-        goldenagent_core::ToolKind::Exec,
-        "bash 必须是执行类，不能被当成写类按路径放行"
-    );
+    for name in ["bash", "terminal_create", "terminal_write", "terminal_kill"] {
+        assert_eq!(
+            reg.spec(name).unwrap().kind,
+            goldenagent_core::ToolKind::Exec,
+            "{name} 必须是执行类，不能被当成写类按路径放行"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

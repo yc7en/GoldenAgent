@@ -341,6 +341,10 @@ export function QueueListIcon(props: IconProps) {
 export function ToolIcon({ name, ...props }: { name: string } & IconProps) {
   switch (name) {
     case "bash":
+    case "terminal_create":
+    case "terminal_write":
+    case "terminal_read":
+    case "terminal_kill":
       return <CommandLineIcon {...props} />;
     case "read_file":
       return <DocumentTextIcon {...props} />;

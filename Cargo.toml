@@ -22,6 +22,7 @@ goldenagent-app = { path = "crates/app" }
 # --- 第三方 ---
 anyhow = "1"
 async-trait = "0.1"
+portable-pty = "0.9"
 # provider 层唯一的外部 IO 依赖。
 # 版本跟 Tauri 依赖树里的 reqwest（0.13）对齐，避免同时编译两份 hyper/tower。
 # 刻意 default-features = false：只用 json + native-tls（Windows 走 schannel，

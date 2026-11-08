@@ -9,6 +9,7 @@
 // 不允许各层各写一份"算不算在工作区内"的判定。
 pub mod jail;
 pub mod task_manager;
+pub mod terminal;
 
 mod apply_patch;
 mod bash;
@@ -33,9 +34,10 @@ pub use bash::{DEFAULT_TIMEOUT_SECS, MAX_OUTPUT_BYTES, MAX_TIMEOUT_SECS};
 pub use list_dir::MAX_ENTRIES;
 pub use read_file::{DEFAULT_LIMIT, MAX_READ_BYTES};
 pub use task_manager::TaskManager;
+pub use terminal::TerminalManager;
 pub use write_file::MAX_WRITE_BYTES;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolContext {
     /// 主目录。`bash` 的默认 cwd、相对路径的落点、`grep`/`glob` 的默认遍历起点。
     pub workspace: PathBuf,
@@ -48,6 +50,8 @@ pub struct ToolContext {
     pub skills_root: Option<PathBuf>,
     /// 全局后台作业管理器（B21）。
     pub tasks: Arc<TaskManager>,
+    /// 全局有状态终端会话池（B22）。
+    pub terminals: Arc<TerminalManager>,
 }
 
 impl ToolContext {
@@ -57,6 +61,7 @@ impl ToolContext {
             extra_roots: Vec::new(),
             skills_root: None,
             tasks: Arc::new(TaskManager::new()),
+            terminals: Arc::new(TerminalManager::new()),
         }
     }
 
@@ -67,12 +72,19 @@ impl ToolContext {
             extra_roots: extra,
             skills_root: None,
             tasks: Arc::new(TaskManager::new()),
+            terminals: Arc::new(TerminalManager::new()),
         }
     }
 
     /// 挂上后台作业管理器。
     pub fn with_tasks(mut self, tasks: Arc<TaskManager>) -> Self {
         self.tasks = tasks;
+        self
+    }
+
+    /// 挂上有状态终端管理器。
+    pub fn with_terminals(mut self, terminals: Arc<TerminalManager>) -> Self {
+        self.terminals = terminals;
         self
     }
 
@@ -139,6 +151,10 @@ impl Registry {
         registry.register(Arc::new(apply_patch::ApplyPatch));
         registry.register(Arc::new(bash::Bash));
         registry.register(Arc::new(manage_task::ManageTask));
+        registry.register(Arc::new(terminal::tools::TerminalCreate));
+        registry.register(Arc::new(terminal::tools::TerminalWrite));
+        registry.register(Arc::new(terminal::tools::TerminalRead));
+        registry.register(Arc::new(terminal::tools::TerminalKill));
         registry
     }
 

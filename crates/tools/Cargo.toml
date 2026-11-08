@@ -8,5 +8,6 @@ license.workspace = true
 [dependencies]
 goldenagent-core = { workspace = true }
 async-trait = { workspace = true }
+portable-pty = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

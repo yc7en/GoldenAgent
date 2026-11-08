@@ -1048,3 +1048,65 @@ async fn scenario_background_job_and_reactive_wakeup() {
     assert!(full_history_text.contains("BUILD_SUCCESS_V2"));
     assert!(full_history_text.contains("刚才在后台运行的构建任务已顺利完成"));
 }
+
+/// 场景 16：B22 有状态交互式终端（Stateful PTY Daemon）。
+/// 验证通过 terminal_create 启动 PTY 会话、terminal_write 发送命令、terminal_read 读取屏幕增量与 terminal_kill 销毁。
+#[tokio::test]
+async fn scenario_terminal_interactive_session() {
+    let ws = Workspace::new();
+
+    #[cfg(windows)]
+    let echo_input = "echo TERM_E2E_OK\r\n";
+    #[cfg(not(windows))]
+    let echo_input = "echo TERM_E2E_OK\n";
+
+    let write_arg = serde_json::json!({
+        "terminal_id": "term-1",
+        "input": echo_input,
+        "summary": "执行命令"
+    })
+    .to_string();
+
+    let vendor = Vendor::start(vec![
+        // 1. 模型首先创建终端
+        Reply::Sse(tool_frames(&[(
+            "call_term_1",
+            "terminal_create",
+            r#"{"name":"e2e-term","summary":"创建测试终端"}"#,
+        )])),
+        // 2. 模型向终端写入 echo 命令
+        Reply::Sse(tool_frames(&[("call_term_2", "terminal_write", &write_arg)])),
+        // 3. 模型读取终端屏幕增量
+        Reply::Sse(tool_frames(&[(
+            "call_term_3",
+            "terminal_read",
+            r#"{"terminal_id":"term-1","timeout_ms":2000,"inactivity_ms":300,"summary":"读取终端输出"}"#,
+        )])),
+        // 4. 模型关闭终端并做汇报
+        Reply::Sse(tool_frames(&[(
+            "call_term_4",
+            "terminal_kill",
+            r#"{"terminal_id":"term-1","summary":"关闭终端"}"#,
+        )])),
+        // 5. 最终结论
+        Reply::Sse(text_frames(&["终端有状态交互已全部完成并已销毁。"])),
+    ])
+    .await;
+
+    let service = service(&ws, &vendor, Mode::Bypass);
+
+    let (events, outcome) = run(&service, "在终端中跑个命令").await;
+    assert_eq!(outcome.unwrap(), Outcome::Completed { turns: 5 });
+
+    let results = tool_results(&events);
+    assert_eq!(results.len(), 4);
+    // 验证 terminal_create
+    assert!(results[0].1.contains("term-1"));
+    // 验证 terminal_write
+    assert!(results[1].1.contains("bytes_written"));
+    // 验证 terminal_read 抓到了输出
+    assert!(results[2].1.contains("TERM_E2E_OK"));
+    // 验证 terminal_kill
+    assert!(results[3].1.contains("\"killed\":true"));
+}
+

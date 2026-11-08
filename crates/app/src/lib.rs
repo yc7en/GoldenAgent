@@ -141,13 +141,14 @@ impl AgentConfig {
 
 const DEFAULT_SYSTEM: &str = "你是 GoldenAgent，一个运行在用户本机的编程助手。\
 你可以：读文件、写文件、列目录、按内容搜索（grep）、按文件名查找（glob）、\
-精确替换几行（apply_patch）、执行 shell 命令（bash）、委派只读调研子代理（invoke_subagent）、管理后台作业系统（manage_task）。\
+精确替换几行（apply_patch）、执行 shell 命令（bash）、管理有状态终端会话（terminal_create/terminal_write/terminal_read/terminal_kill）、委派只读调研子代理（invoke_subagent）、管理后台作业系统（manage_task）。\
 做事之前先看再改：不确定路径就先 list_dir 或 glob，找代码先 grep，别猜。\
 只改几行用 apply_patch，整份重写才用 write_file——后者会把没读到的内容一起冲掉。\
 执行命令前想清楚它会不会动到工作区外的东西。\
+需要持续交互、等待确认问答（如 [y/N]）、保持工作目录状态（如 cd）或运行常驻开发服务时，优先使用 terminal_create 创建持久终端，配合 terminal_write 与 terminal_read 进行交互操作。\
 当你需要跨多个文件排查问题、定位调用链或进行大量代码调研时，优先调用 invoke_subagent 委派只读子代理，以精炼摘要形式获取结论，避免中间探索过程污染主会话上下文。\
 长耗时任务（如大型项目编译、全量测试、网络爬虫或复杂子代理排查）可在 bash 或 invoke_subagent 中指定 background: true 派发至后台独立运行，不阻塞主会话，并使用 manage_task 随时查看进度或终止任务。\
-调用工具时，必须在 summary 字段用精炼的中文短语（4-8字）说明操作意图（如'阅读主界面结构'、'查看样式定义'、'调研渲染管线'、'查看后台任务'）。\
+调用工具时，必须在 summary 字段用精炼的中文短语（4-8字）说明操作意图（如'阅读主界面结构'、'查看样式定义'、'创建交互终端'、'执行终端命令'、'调研渲染管线'、'查看后台任务'）。\
 回答用中文，简洁直接。";
 
 /// 技能目录名。与 `sessions/`、`spaces.json` 并列放在状态目录下——
@@ -315,6 +316,7 @@ pub struct AgentService {
     approver: Arc<EventApprover>,
     tasks: Arc<goldenagent_tools::TaskManager>,
     task_inbox: Arc<StdMutex<Vec<goldenagent_core::TaskInfo>>>,
+    terminals: Arc<goldenagent_tools::TerminalManager>,
 }
 
 /// 一轮运行要用的装配参数。
@@ -343,6 +345,7 @@ impl AgentService {
         let active = ActiveWorkspace::new(None, config.workspace.clone(), Vec::new());
         let tasks = Arc::new(goldenagent_tools::TaskManager::new());
         let task_inbox = Arc::new(StdMutex::new(Vec::new()));
+        let terminals = Arc::new(goldenagent_tools::TerminalManager::new());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         tasks.set_notifier(tx);
         let inbox_clone = Arc::clone(&task_inbox);
@@ -382,6 +385,7 @@ impl AgentService {
             approver,
             tasks,
             task_inbox,
+            terminals,
         }
     }
 
@@ -393,6 +397,11 @@ impl AgentService {
     /// 后台作业管理器（B21）。
     pub fn tasks(&self) -> &goldenagent_tools::TaskManager {
         &self.tasks
+    }
+
+    /// 有状态终端管理器（B22）。
+    pub fn terminals(&self) -> &goldenagent_tools::TerminalManager {
+        &self.terminals
     }
 
     /// 响应式自主唤醒（Reactive Wakeup，A-16）。
@@ -902,6 +911,7 @@ impl AgentService {
         }
 
         self.session.lock().await.clear();
+        self.terminals.clear();
         if let Ok(mut slot) = self.session_id.lock() {
             *slot = None;
         }
@@ -1232,6 +1242,7 @@ impl AgentService {
                 enable_subagent: true,
                 subagent_max_turns: 6,
                 tasks: Some(Arc::clone(&self.tasks)),
+                terminals: Some(Arc::clone(&self.terminals)),
             },
         )
     }

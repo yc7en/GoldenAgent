@@ -109,6 +109,8 @@ pub struct Config {
     pub subagent_max_turns: u32,
     /// 全局后台作业管理器（B21）。`None` 时使用独立实例。
     pub tasks: Option<Arc<goldenagent_tools::TaskManager>>,
+    /// 全局有状态终端管理器（B22）。`None` 时使用独立实例。
+    pub terminals: Option<Arc<goldenagent_tools::TerminalManager>>,
 }
 
 impl Default for Config {
@@ -127,6 +129,7 @@ impl Default for Config {
             enable_subagent: true,
             subagent_max_turns: subagent::DEFAULT_SUBAGENT_MAX_TURNS,
             tasks: None,
+            terminals: None,
         }
     }
 }
@@ -171,6 +174,10 @@ impl AgentLoop {
         // 后台作业管理器（B21）。
         if let Some(tasks) = config.tasks.clone() {
             ctx = ctx.with_tasks(tasks);
+        }
+        // 有状态终端管理器（B22）。
+        if let Some(terminals) = config.terminals.clone() {
+            ctx = ctx.with_terminals(terminals);
         }
 
         // B20: 当开启子代理且尚未挂载 invoke_subagent 时，自动挂载只读子代理工具。
