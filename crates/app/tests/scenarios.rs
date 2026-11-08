@@ -1110,3 +1110,66 @@ async fn scenario_terminal_interactive_session() {
     assert!(results[3].1.contains("\"killed\":true"));
 }
 
+/// 场景 17：B23 操作系统级物理沙箱与环境变量脱敏（OS Sandbox & Secret Masking）。
+/// 验证宿主进程中存在的敏感环境变量（如 AWS_ACCESS_KEY_ID, MY_SECRET_TOKEN, PRIVATE_PASSWD）在执行 bash 工具时已被彻底剥离脱敏。
+#[tokio::test]
+async fn scenario_sandbox_secret_masking() {
+    // 确保清理遗留变量
+    std::env::remove_var("OPENAI_API_KEY");
+    std::env::set_var("MY_SECRET_TOKEN", "sk-secret-token-should-not-leak-12345");
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    std::env::set_var("PRIVATE_PASSWD", "super-secret-password-xyz");
+
+    let ws = Workspace::new();
+
+    #[cfg(windows)]
+    let cmd = "cmd /c set";
+    #[cfg(not(windows))]
+    let cmd = "env";
+
+    let bash_arg = serde_json::json!({
+        "command": cmd
+    })
+    .to_string();
+
+    let vendor = Vendor::start(vec![
+        Reply::Sse(tool_frames(&[(
+            "call_bash_1",
+            "bash",
+            &bash_arg,
+        )])),
+        Reply::Sse(text_frames(&["已执行环境探测。"])),
+    ])
+    .await;
+
+    let service = service(&ws, &vendor, Mode::Bypass);
+
+    let (events, outcome) = run(&service, "查看环境变量").await;
+
+    // 清理测试环境变量
+    std::env::remove_var("MY_SECRET_TOKEN");
+    std::env::remove_var("AWS_ACCESS_KEY_ID");
+    std::env::remove_var("PRIVATE_PASSWD");
+
+    assert_eq!(outcome.unwrap(), Outcome::Completed { turns: 2 });
+
+    let results = tool_results(&events);
+    assert_eq!(results.len(), 1);
+    let output = &results[0].1;
+
+    // 确保命令执行成功（包含常规系统变量如 PATH 或 SystemRoot / USER）
+    #[cfg(windows)]
+    assert!(output.to_lowercase().contains("path="));
+    #[cfg(not(windows))]
+    assert!(output.contains("PATH="));
+
+    // 确保敏感环境变量未泄漏到子进程输出中
+    assert!(!output.contains("sk-secret-token-should-not-leak"));
+    assert!(!output.contains("AKIAIOSFODNN7EXAMPLE"));
+    assert!(!output.contains("super-secret-password-xyz"));
+    assert!(!output.contains("MY_SECRET_TOKEN"));
+    assert!(!output.contains("AWS_ACCESS_KEY_ID"));
+    assert!(!output.contains("PRIVATE_PASSWD"));
+}
+
+

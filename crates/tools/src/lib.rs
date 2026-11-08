@@ -8,6 +8,7 @@
 // jail 对外可见：policy 层要复用同一套路径归一化逻辑，
 // 不允许各层各写一份"算不算在工作区内"的判定。
 pub mod jail;
+pub mod sandbox;
 pub mod task_manager;
 pub mod terminal;
 

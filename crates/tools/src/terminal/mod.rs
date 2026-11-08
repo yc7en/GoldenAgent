@@ -84,11 +84,19 @@ impl TerminalSession {
 
         let mut cmd = CommandBuilder::new(shell_cmd);
         cmd.cwd(&cwd);
+        // B23: 环境变量脱敏与白名单隔离（Secret Masking）
+        crate::sandbox::apply_to_pty_command(&mut cmd);
 
         let child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| format!("启动终端进程失败 ({shell_cmd}): {e}"))?;
+
+        // B23: Windows 平台将 PTY 进程加入内核 Job Object
+        #[cfg(windows)]
+        if let Some(pid) = child.process_id() {
+            let _ = crate::sandbox::assign_process_pid(pid);
+        }
         drop(pair.slave);
 
         let mut reader = pair

@@ -83,6 +83,9 @@ async fn execute_command(
     timeout_secs: u64,
 ) -> Result<String> {
         let mut builder = shell_command(command);
+        // B23: 环境变量脱敏与白名单隔离（Secret Masking）
+        crate::sandbox::apply_to_tokio_command(&mut builder);
+
         builder
             .current_dir(&cwd)
             // 不接 stdin：命令若是 `read` 之类，会一直等到超时，那是最难解释的一种"卡住"。
@@ -95,6 +98,12 @@ async fn execute_command(
         let mut child = builder
             .spawn()
             .map_err(|e| Error::Tool(format!("启动命令失败: {e}")))?;
+
+        // B23: Windows 平台将子进程加入内核 Job Object，限制进程树与内存，绑定 KillOnClose
+        #[cfg(windows)]
+        if let Some(pid) = child.id() {
+            let _ = crate::sandbox::assign_process_pid(pid);
+        }
 
         let mut stdout = child
             .stdout
