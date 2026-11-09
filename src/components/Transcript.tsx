@@ -85,6 +85,14 @@ function getToolDisplay(name: string, input: unknown): { summary: string; detail
       return { summary: detail ? `关闭终端 ${detail}` : "终止终端会话", detail };
     case "inspect_spill":
       return { summary: detail ? `查阅溢出日志 ${detail}` : "查阅大输出溢出日志", detail };
+    case "lsp_definition":
+      return { summary: detail ? `跳转定义 ${detail}` : "跳转符号定义", detail };
+    case "lsp_references":
+      return { summary: detail ? `查找引用 ${detail}` : "查找符号全项目引用", detail };
+    case "lsp_diagnostics":
+      return { summary: detail ? `检查诊断 ${detail}` : "查看实时编译诊断", detail };
+    case "lsp_rename":
+      return { summary: detail ? `重命名符号 ${detail}` : "安全重命名符号", detail };
     default:
       return { summary: `${name} ${detail}`.trim(), detail };
   }

@@ -172,7 +172,11 @@ impl Policy {
     }
 
     fn decide_write(&self, spec: &ToolSpec, input: &Value) -> Decision {
-        let Some(raw_path) = input.get("path").and_then(Value::as_str) else {
+        let raw_path = input
+            .get("path")
+            .or_else(|| input.get("file"))
+            .and_then(Value::as_str);
+        let Some(raw_path) = raw_path else {
             // 写工具不说明写哪儿，没法判，只能拒。
             return Decision::Deny {
                 reason: format!("{} 没有提供 path，无法确定写入目标", spec.name),

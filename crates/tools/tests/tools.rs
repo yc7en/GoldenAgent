@@ -219,6 +219,10 @@ fn default_registry_exposes_all_tools() {
             "grep",
             "inspect_spill",
             "list_dir",
+            "lsp_definition",
+            "lsp_diagnostics",
+            "lsp_references",
+            "lsp_rename",
             "manage_task",
             "read_file",
             "terminal_create",
@@ -241,6 +245,9 @@ fn default_registry_exposes_all_tools() {
         "manage_task",
         "terminal_read",
         "inspect_spill",
+        "lsp_definition",
+        "lsp_references",
+        "lsp_diagnostics",
     ] {
         assert_eq!(
             reg.spec(name).unwrap().kind,
@@ -248,7 +255,7 @@ fn default_registry_exposes_all_tools() {
             "{name} 应是读类"
         );
     }
-    for name in ["write_file", "apply_patch"] {
+    for name in ["write_file", "apply_patch", "lsp_rename"] {
         assert_eq!(
             reg.spec(name).unwrap().kind,
             goldenagent_core::ToolKind::Write,

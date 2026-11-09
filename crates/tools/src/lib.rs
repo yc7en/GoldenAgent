@@ -8,6 +8,7 @@
 // jail 对外可见：policy 层要复用同一套路径归一化逻辑，
 // 不允许各层各写一份"算不算在工作区内"的判定。
 pub mod jail;
+pub mod lsp;
 pub mod sandbox;
 pub mod spill;
 pub mod task_manager;
@@ -34,6 +35,7 @@ use goldenagent_core::{Error, Result, ToolSpec};
 pub use apply_patch::MAX_EDITS;
 pub use bash::{DEFAULT_TIMEOUT_SECS, MAX_OUTPUT_BYTES, MAX_TIMEOUT_SECS};
 pub use list_dir::MAX_ENTRIES;
+pub use lsp::{LspClient, LspDefinition, LspDiagnostics, LspManager, LspReferences, LspRename};
 pub use read_file::{DEFAULT_LIMIT, MAX_READ_BYTES};
 pub use spill::{InspectSpill, SpillManager, DEFAULT_SPILL_THRESHOLD_BYTES, SPILL_DIR_NAME};
 pub use task_manager::TaskManager;
@@ -57,6 +59,8 @@ pub struct ToolContext {
     pub terminals: Arc<TerminalManager>,
     /// 全局大结果溢出管理器（B25）。
     pub spill: Arc<SpillManager>,
+    /// 全局语言服务器管理器（B26）。
+    pub lsp: Arc<LspManager>,
 }
 
 impl ToolContext {
@@ -70,6 +74,7 @@ impl ToolContext {
             tasks: Arc::new(TaskManager::new()),
             terminals: Arc::new(TerminalManager::new()),
             spill,
+            lsp: Arc::new(LspManager::new()),
         }
     }
 
@@ -84,6 +89,7 @@ impl ToolContext {
             tasks: Arc::new(TaskManager::new()),
             terminals: Arc::new(TerminalManager::new()),
             spill,
+            lsp: Arc::new(LspManager::new()),
         }
     }
 
@@ -102,6 +108,12 @@ impl ToolContext {
     /// 挂上溢出管理器。
     pub fn with_spill(mut self, spill: Arc<SpillManager>) -> Self {
         self.spill = spill;
+        self
+    }
+
+    /// 挂上语言服务器管理器。
+    pub fn with_lsp(mut self, lsp: Arc<LspManager>) -> Self {
+        self.lsp = lsp;
         self
     }
 
@@ -173,6 +185,10 @@ impl Registry {
         registry.register(Arc::new(terminal::tools::TerminalRead));
         registry.register(Arc::new(terminal::tools::TerminalKill));
         registry.register(Arc::new(spill::InspectSpill));
+        registry.register(Arc::new(lsp::LspDefinition));
+        registry.register(Arc::new(lsp::LspReferences));
+        registry.register(Arc::new(lsp::LspDiagnostics));
+        registry.register(Arc::new(lsp::LspRename));
         registry
     }
 

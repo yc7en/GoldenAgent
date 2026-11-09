@@ -111,6 +111,8 @@ pub struct Config {
     pub tasks: Option<Arc<goldenagent_tools::TaskManager>>,
     /// 全局有状态终端管理器（B22）。`None` 时使用独立实例。
     pub terminals: Option<Arc<goldenagent_tools::TerminalManager>>,
+    /// 全局语言服务器管理器（B26）。`None` 时使用独立实例。
+    pub lsp: Option<Arc<goldenagent_tools::LspManager>>,
 }
 
 impl Default for Config {
@@ -130,6 +132,7 @@ impl Default for Config {
             subagent_max_turns: subagent::DEFAULT_SUBAGENT_MAX_TURNS,
             tasks: None,
             terminals: None,
+            lsp: None,
         }
     }
 }
@@ -178,6 +181,10 @@ impl AgentLoop {
         // 有状态终端管理器（B22）。
         if let Some(terminals) = config.terminals.clone() {
             ctx = ctx.with_terminals(terminals);
+        }
+        // 语言服务器管理器（B26）。
+        if let Some(lsp) = config.lsp.clone() {
+            ctx = ctx.with_lsp(lsp);
         }
 
         // B20: 当开启子代理且尚未挂载 invoke_subagent 时，自动挂载只读子代理工具。

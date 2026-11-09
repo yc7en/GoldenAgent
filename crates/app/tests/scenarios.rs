@@ -1234,5 +1234,119 @@ async fn scenario_tool_output_spill_and_inspect() {
     assert!(second_result.contains("1199 | "));
 }
 
+/// 场景 19：LSP 语义探索与安全重命名（B26）。
+/// 模型先通过 lsp_definition 跳转符号定义，再通过 lsp_rename 进行跨文件安全修改。
+#[tokio::test]
+async fn scenario_lsp_semantic_analysis_and_rename() {
+    let ws = Workspace::new();
+    let src_dir = ws.path.join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+
+    let main_rs = src_dir.join("main.rs");
+    let models_rs = src_dir.join("models.rs");
+
+    std::fs::write(&main_rs, "use crate::models::User;\nfn main() { let _u = User { id: 1 }; }").unwrap();
+    std::fs::write(&models_rs, "pub struct User {\n    pub id: u64,\n}\n").unwrap();
+
+    let main_uri = goldenagent_tools::lsp::path_to_uri(&main_rs);
+    let models_uri = goldenagent_tools::lsp::path_to_uri(&models_rs);
+
+    let mock_client = goldenagent_tools::LspClient::mock(ws.path.clone(), move |req| {
+        let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        match method {
+            "initialize" => Some(serde_json::json!({"result": {"capabilities": {}}})),
+            "textDocument/definition" => Some(serde_json::json!({
+                "result": [
+                    {
+                        "uri": models_uri.clone(),
+                        "range": {
+                            "start": { "line": 0, "character": 11 },
+                            "end": { "line": 0, "character": 15 }
+                        }
+                    }
+                ]
+            })),
+            "textDocument/rename" => Some(serde_json::json!({
+                "result": {
+                    "changes": {
+                        main_uri.clone(): [
+                            {
+                                "range": {
+                                    "start": { "line": 0, "character": 19 },
+                                    "end": { "line": 0, "character": 23 }
+                                },
+                                "newText": "AccountUser"
+                            },
+                            {
+                                "range": {
+                                    "start": { "line": 1, "character": 21 },
+                                    "end": { "line": 1, "character": 25 }
+                                },
+                                "newText": "AccountUser"
+                            }
+                        ],
+                        models_uri.clone(): [
+                            {
+                                "range": {
+                                    "start": { "line": 0, "character": 11 },
+                                    "end": { "line": 0, "character": 15 }
+                                },
+                                "newText": "AccountUser"
+                            }
+                        ]
+                    }
+                }
+            })),
+            _ => None,
+        }
+    });
+
+    let vendor = Vendor::start(vec![
+        // 1. 模型调用 lsp_definition 查找 User 的定义
+        Reply::Sse(tool_frames(&[(
+            "call_def_1",
+            "lsp_definition",
+            r#"{"path":"src/main.rs","line":1,"character":21,"summary":"查找结构体定义"}"#,
+        )])),
+        // 2. 找到定义后，模型调用 lsp_rename 安全重命名为 AccountUser
+        Reply::Sse(tool_frames(&[(
+            "call_rename_1",
+            "lsp_rename",
+            r#"{"path":"src/models.rs","line":1,"character":12,"new_name":"AccountUser","summary":"安全重命名结构体"}"#,
+        )])),
+        // 3. 模型汇报完成
+        Reply::Sse(text_frames(&["已成功跳转定义并完成跨文件符号重命名。"])),
+    ])
+    .await;
+
+    let service = service(&ws, &vendor, Mode::Bypass);
+    service.lsp().register_mock_client("rust", mock_client).await;
+
+    let (events, outcome) = run(&service, "探索代码并把 User 重命名为 AccountUser").await;
+    assert_eq!(outcome.unwrap(), Outcome::Completed { turns: 3 });
+
+    let results = tool_results(&events);
+    assert_eq!(results.len(), 2);
+
+    // 验证 lsp_definition 返回了正确的定义文件与预览
+    let def_result = &results[0].1;
+    assert!(def_result.contains("找到 1 处定义"));
+    assert!(def_result.contains("models.rs:1:12"));
+    assert!(def_result.contains("pub struct User"));
+
+    // 验证 lsp_rename 返回成功总结
+    let rename_result = &results[1].1;
+    assert!(rename_result.contains("成功将符号重命名为 'AccountUser'"));
+    assert!(rename_result.contains("共涉及 2 个文件"));
+
+    // 验证磁盘上的两个文件均被原子修改
+    let main_content = std::fs::read_to_string(&main_rs).unwrap();
+    assert!(main_content.contains("use crate::models::AccountUser;"));
+    assert!(main_content.contains("AccountUser { id: 1 }"));
+
+    let models_content = std::fs::read_to_string(&models_rs).unwrap();
+    assert!(models_content.contains("pub struct AccountUser {"));
+}
+
 
 

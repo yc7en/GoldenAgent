@@ -338,6 +338,26 @@ export function QueueListIcon(props: IconProps) {
   );
 }
 
+/** Heroicons Outline: ExclamationCircleIcon */
+export function ExclamationCircleIcon(props: IconProps) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      fill="none"
+      viewBox="0 0 24 24"
+      strokeWidth={1.75}
+      stroke="currentColor"
+      {...props}
+    >
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M12 9v3.75m9-.75a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9 3.75h.008v.008H12v-.008Z"
+      />
+    </svg>
+  );
+}
+
 export function ToolIcon({ name, ...props }: { name: string } & IconProps) {
   switch (name) {
     case "bash":
@@ -366,6 +386,14 @@ export function ToolIcon({ name, ...props }: { name: string } & IconProps) {
       return <QueueListIcon {...props} />;
     case "inspect_spill":
       return <DocumentMagnifyingGlassIcon {...props} />;
+    case "lsp_definition":
+      return <CodeBracketIcon {...props} />;
+    case "lsp_references":
+      return <MagnifyingGlassIcon {...props} />;
+    case "lsp_diagnostics":
+      return <ExclamationCircleIcon {...props} />;
+    case "lsp_rename":
+      return <PencilSquareIcon {...props} />;
     default:
       return <WrenchScrewdriverIcon {...props} />;
   }

@@ -138,6 +138,7 @@ impl InvokeSubagent {
             subagent_max_turns: 0,
             tasks: Some(Arc::clone(&ctx.tasks)),
             terminals: Some(Arc::clone(&ctx.terminals)),
+            lsp: Some(Arc::clone(&ctx.lsp)),
         };
 
         let sub_agent = AgentLoop::new(

@@ -9,6 +9,7 @@
 mod error;
 mod event;
 mod event_sourcing;
+pub mod lsp;
 mod message;
 mod task;
 mod tool;
@@ -16,6 +17,7 @@ mod tool;
 pub use error::{Error, Result};
 pub use event::{Event, StopReason};
 pub use event_sourcing::{Artifact, ArtifactAction, SessionEvent, UIState};
+pub use lsp::{LspDiagnostic, LspLocation, LspPosition};
 pub use message::{ContentBlock, Message, Role, ToolCall, ToolResult};
 pub use task::{TaskInfo, TaskStatus};
 pub use tool::{SpillHandle, ToolKind, ToolSpec};
