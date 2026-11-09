@@ -442,13 +442,24 @@ impl AgentLoop {
         }
 
         self.emit_started(events, &call);
-        let (ok, output) = tokio::select! {
+        let (ok, mut output) = tokio::select! {
             res = self.tools.run(&call.name, call.input.clone(), &self.ctx) => match res {
                 Ok(output) => (true, output),
                 Err(error) => (false, error.to_string()),
             },
             _ = cancel.cancelled() => (false, "已取消".to_string()),
         };
+
+        // B25: 大结果溢出拦截器（Spill & Handle Pattern）
+        // 遵循 ARCHITECTURE.md A-20：输出超阈值时落盘并回传结构化句柄，防止撑爆上下文或遗漏尾部报错
+        if ok && call.name != "inspect_spill" {
+            if let Ok(Some(handle)) = self.ctx.spill.maybe_spill(&output).await {
+                if let Ok(json) = serde_json::to_string_pretty(&handle) {
+                    output = json;
+                }
+            }
+        }
+
         self.emit_finished(events, &call.id, &call.name, ok, &output);
 
         ToolResult {

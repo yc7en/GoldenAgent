@@ -9,6 +9,7 @@
 // 不允许各层各写一份"算不算在工作区内"的判定。
 pub mod jail;
 pub mod sandbox;
+pub mod spill;
 pub mod task_manager;
 pub mod terminal;
 
@@ -34,6 +35,7 @@ pub use apply_patch::MAX_EDITS;
 pub use bash::{DEFAULT_TIMEOUT_SECS, MAX_OUTPUT_BYTES, MAX_TIMEOUT_SECS};
 pub use list_dir::MAX_ENTRIES;
 pub use read_file::{DEFAULT_LIMIT, MAX_READ_BYTES};
+pub use spill::{InspectSpill, SpillManager, DEFAULT_SPILL_THRESHOLD_BYTES, SPILL_DIR_NAME};
 pub use task_manager::TaskManager;
 pub use terminal::TerminalManager;
 pub use write_file::MAX_WRITE_BYTES;
@@ -53,27 +55,35 @@ pub struct ToolContext {
     pub tasks: Arc<TaskManager>,
     /// 全局有状态终端会话池（B22）。
     pub terminals: Arc<TerminalManager>,
+    /// 全局大结果溢出管理器（B25）。
+    pub spill: Arc<SpillManager>,
 }
 
 impl ToolContext {
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
+        let ws = workspace.into();
+        let spill = Arc::new(SpillManager::new(&ws));
         Self {
-            workspace: workspace.into(),
+            workspace: ws,
             extra_roots: Vec::new(),
             skills_root: None,
             tasks: Arc::new(TaskManager::new()),
             terminals: Arc::new(TerminalManager::new()),
+            spill,
         }
     }
 
     /// 多根构造：`primary` 在前，附加目录在后。顺序就是优先级。
     pub fn with_roots(primary: impl Into<PathBuf>, extra: Vec<PathBuf>) -> Self {
+        let ws = primary.into();
+        let spill = Arc::new(SpillManager::new(&ws));
         Self {
-            workspace: primary.into(),
+            workspace: ws,
             extra_roots: extra,
             skills_root: None,
             tasks: Arc::new(TaskManager::new()),
             terminals: Arc::new(TerminalManager::new()),
+            spill,
         }
     }
 
@@ -86,6 +96,12 @@ impl ToolContext {
     /// 挂上有状态终端管理器。
     pub fn with_terminals(mut self, terminals: Arc<TerminalManager>) -> Self {
         self.terminals = terminals;
+        self
+    }
+
+    /// 挂上溢出管理器。
+    pub fn with_spill(mut self, spill: Arc<SpillManager>) -> Self {
+        self.spill = spill;
         self
     }
 
@@ -156,6 +172,7 @@ impl Registry {
         registry.register(Arc::new(terminal::tools::TerminalWrite));
         registry.register(Arc::new(terminal::tools::TerminalRead));
         registry.register(Arc::new(terminal::tools::TerminalKill));
+        registry.register(Arc::new(spill::InspectSpill));
         registry
     }
 

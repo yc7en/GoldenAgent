@@ -364,6 +364,8 @@ export function ToolIcon({ name, ...props }: { name: string } & IconProps) {
       return <CpuChipIcon {...props} />;
     case "manage_task":
       return <QueueListIcon {...props} />;
+    case "inspect_spill":
+      return <DocumentMagnifyingGlassIcon {...props} />;
     default:
       return <WrenchScrewdriverIcon {...props} />;
   }

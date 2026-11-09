@@ -83,6 +83,8 @@ function getToolDisplay(name: string, input: unknown): { summary: string; detail
       return { summary: detail ? `读取 ${detail}` : "读取终端屏幕增量", detail };
     case "terminal_kill":
       return { summary: detail ? `关闭终端 ${detail}` : "终止终端会话", detail };
+    case "inspect_spill":
+      return { summary: detail ? `查阅溢出日志 ${detail}` : "查阅大输出溢出日志", detail };
     default:
       return { summary: `${name} ${detail}`.trim(), detail };
   }

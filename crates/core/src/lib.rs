@@ -18,4 +18,4 @@ pub use event::{Event, StopReason};
 pub use event_sourcing::{Artifact, ArtifactAction, SessionEvent, UIState};
 pub use message::{ContentBlock, Message, Role, ToolCall, ToolResult};
 pub use task::{TaskInfo, TaskStatus};
-pub use tool::{ToolKind, ToolSpec};
+pub use tool::{SpillHandle, ToolKind, ToolSpec};

@@ -38,3 +38,35 @@ impl ToolSpec {
         }
     }
 }
+
+/// 大结果溢出句柄（遵循 ARCHITECTURE.md A-20：Spill & Handle Pattern）。
+///
+/// 当工具执行输出超过配额阈值（默认 32 KiB）时，完整数据落盘，向模型返回本句柄。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpillHandle {
+    pub status: String,
+    pub file: String,
+    pub total_lines: usize,
+    pub total_bytes: usize,
+    pub preview_head: String,
+    pub preview_tail: String,
+}
+
+impl SpillHandle {
+    pub fn new(
+        file: impl Into<String>,
+        total_lines: usize,
+        total_bytes: usize,
+        preview_head: impl Into<String>,
+        preview_tail: impl Into<String>,
+    ) -> Self {
+        Self {
+            status: "spilled".into(),
+            file: file.into(),
+            total_lines,
+            total_bytes,
+            preview_head: preview_head.into(),
+            preview_tail: preview_tail.into(),
+        }
+    }
+}

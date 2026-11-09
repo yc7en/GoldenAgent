@@ -1172,4 +1172,67 @@ async fn scenario_sandbox_secret_masking() {
     assert!(!output.contains("PRIVATE_PASSWD"));
 }
 
+/// 场景 18：B25 大结果溢出与句柄机制（Spill & Handle Pattern）。
+/// 工具产出 > 32 KiB 巨量输出时，自动拦截落盘为结构化句柄；
+/// 模型在下一轮调用 inspect_spill 定向翻阅特定行范围。
+#[tokio::test]
+async fn scenario_tool_output_spill_and_inspect() {
+    let ws = Workspace::new();
+
+    // 预先生成一个 > 32 KiB 的大日志文件
+    let mut large_text = String::new();
+    for i in 1..=1200 {
+        large_text.push_str(&format!("BUILD_STEP_{i:04}: compile details info\n"));
+    }
+    assert!(large_text.len() > 32 * 1024);
+    ws.write("large_build.log", &large_text);
+    ws.write(".goldenagent/spill/spill_test.log", &large_text);
+
+    let read_arg = serde_json::json!({
+        "path": "large_build.log",
+        "limit": 2000
+    })
+    .to_string();
+
+    let vendor = Vendor::start(vec![
+        // 1. 模型尝试读取这个大文件
+        Reply::Sse(tool_frames(&[(
+            "call_read_1",
+            "read_file",
+            &read_arg,
+        )])),
+        // 2. 收到溢出句柄后，模型调用 inspect_spill 翻阅尾部第 1180 到 1200 行
+        Reply::Sse(tool_frames(&[(
+            "call_inspect_1",
+            "inspect_spill",
+            r#"{"file":".goldenagent/spill/spill_test.log","start_line":1180,"count":20,"summary":"查阅构建末尾日志"}"#,
+        )])),
+        // 3. 模型给出结论
+        Reply::Sse(text_frames(&["已精准定位到末尾构建日志。"])),
+    ])
+    .await;
+
+    let service = service(&ws, &vendor, Mode::Bypass);
+
+    let (events, outcome) = run(&service, "读取大型日志并排查末尾错误").await;
+    assert_eq!(outcome.unwrap(), Outcome::Completed { turns: 3 });
+
+    let results = tool_results(&events);
+    assert_eq!(results.len(), 2);
+
+    // 第一个工具结果已被自动拦截为 Spill 句柄 JSON
+    let first_result = &results[0].1;
+    assert!(first_result.contains("\"status\": \"spilled\""));
+    assert!(first_result.contains("\"file\":"));
+    assert!(first_result.contains("BUILD_STEP_0001:"));
+    assert!(first_result.contains("BUILD_STEP_1200:"));
+    assert!(first_result.contains("\"total_lines\": 1200"));
+
+    // 第二个工具结果是 inspect_spill，返回了指定行号切片
+    let second_result = &results[1].1;
+    assert!(second_result.contains("1180 | "));
+    assert!(second_result.contains("1199 | "));
+}
+
+
 

@@ -217,6 +217,7 @@ fn default_registry_exposes_all_tools() {
             "bash",
             "glob",
             "grep",
+            "inspect_spill",
             "list_dir",
             "manage_task",
             "read_file",
@@ -239,6 +240,7 @@ fn default_registry_exposes_all_tools() {
         "use_skill",
         "manage_task",
         "terminal_read",
+        "inspect_spill",
     ] {
         assert_eq!(
             reg.spec(name).unwrap().kind,
