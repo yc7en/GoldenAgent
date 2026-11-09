@@ -6,6 +6,8 @@
 //! 关键约定：[`Event`] 是整个系统对外唯一的状态出口。
 //! 前端、CLI、日志、测试全部只消费事件，不允许伸手去读内部结构。
 
+pub mod acp;
+pub mod card;
 mod error;
 mod event;
 mod event_sourcing;
@@ -14,6 +16,8 @@ mod message;
 mod task;
 mod tool;
 
+pub use acp::{AcpError, AcpNotification, AcpRequest, AcpResponse};
+pub use card::{CardInteraction, UiCardKind, UiCardSpec};
 pub use error::{Error, Result};
 pub use event::{Event, StopReason};
 pub use event_sourcing::{Artifact, ArtifactAction, SessionEvent, UIState};

@@ -84,6 +84,14 @@ pub enum Event {
         ok: bool,
         output: String,
     },
+    /// 声明式富交互卡片下发（B27 Generative UI）。
+    CardPresented {
+        card: crate::card::UiCardSpec,
+    },
+    /// 客户端回投的卡片二次交互（B27）。
+    CardInteracted {
+        interaction: crate::card::CardInteraction,
+    },
     Error {
         message: String,
     },

@@ -394,6 +394,8 @@ export function ToolIcon({ name, ...props }: { name: string } & IconProps) {
       return <ExclamationCircleIcon {...props} />;
     case "lsp_rename":
       return <PencilSquareIcon {...props} />;
+    case "present_card":
+      return <DocumentTextIcon {...props} />;
     default:
       return <WrenchScrewdriverIcon {...props} />;
   }

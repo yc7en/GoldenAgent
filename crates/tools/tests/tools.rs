@@ -224,6 +224,7 @@ fn default_registry_exposes_all_tools() {
             "lsp_references",
             "lsp_rename",
             "manage_task",
+            "present_card",
             "read_file",
             "terminal_create",
             "terminal_kill",
@@ -248,6 +249,7 @@ fn default_registry_exposes_all_tools() {
         "lsp_definition",
         "lsp_references",
         "lsp_diagnostics",
+        "present_card",
     ] {
         assert_eq!(
             reg.spec(name).unwrap().kind,

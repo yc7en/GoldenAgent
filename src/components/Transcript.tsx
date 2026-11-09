@@ -93,6 +93,8 @@ function getToolDisplay(name: string, input: unknown): { summary: string; detail
       return { summary: detail ? `检查诊断 ${detail}` : "查看实时编译诊断", detail };
     case "lsp_rename":
       return { summary: detail ? `重命名符号 ${detail}` : "安全重命名符号", detail };
+    case "present_card":
+      return { summary: detail ? `展示卡片 ${detail}` : "展示富交互卡片", detail };
     default:
       return { summary: `${name} ${detail}`.trim(), detail };
   }

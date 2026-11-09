@@ -317,6 +317,8 @@ fn kinds(events: &[Event]) -> Vec<&'static str> {
             Event::Finished { .. } => "finished",
             Event::TaskStarted { .. } => "task_started",
             Event::TaskCompleted { .. } => "task_completed",
+            Event::CardPresented { .. } => "card_presented",
+            Event::CardInteracted { .. } => "card_interacted",
             Event::Error { .. } => "error",
         })
         .collect()
@@ -1346,6 +1348,39 @@ async fn scenario_lsp_semantic_analysis_and_rename() {
 
     let models_content = std::fs::read_to_string(&models_rs).unwrap();
     assert!(models_content.contains("pub struct AccountUser {"));
+}
+
+/// 场景 20：声明式富交互卡片下发（B27 Generative UI）。
+/// 模型调用 present_card 工具下发操作确认卡片，客户端接收并展示。
+#[tokio::test]
+async fn scenario_present_card_and_interactive_feedback() {
+    let ws = Workspace::new();
+
+    let vendor = Vendor::start(vec![
+        // 1. 模型调用 present_card 下发合并确认卡片
+        Reply::Sse(tool_frames(&[(
+            "call_present_1",
+            "present_card",
+            r#"{"card_id":"merge_branch_b27","kind":"confirmation","title":"确认合并分支","description":"即将把 feature/b27 合并至 main","payload":{"branch":"feature/b27","commits":3},"summary":"展示分支合并确认卡片"}"#,
+        )])),
+        // 2. 模型给出回复
+        Reply::Sse(text_frames(&["已为您下发分支合并确认卡片，请核对。"])),
+    ])
+    .await;
+
+    let service = service(&ws, &vendor, Mode::Bypass);
+
+    let (events, outcome) = run(&service, "准备合并 feature/b27 分支").await;
+    assert_eq!(outcome.unwrap(), Outcome::Completed { turns: 2 });
+
+    let results = tool_results(&events);
+    assert_eq!(results.len(), 1);
+
+    let card_result = &results[0].1;
+    assert!(card_result.contains("富交互卡片已成功下发给客户端"));
+    assert!(card_result.contains("merge_branch_b27"));
+    assert!(card_result.contains("confirmation"));
+    assert!(card_result.contains("确认合并分支"));
 }
 
 

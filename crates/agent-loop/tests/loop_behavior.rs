@@ -107,6 +107,8 @@ fn shape(events: &[Event]) -> Vec<&'static str> {
             Event::Finished { .. } => "finished",
             Event::TaskStarted { .. } => "task_started",
             Event::TaskCompleted { .. } => "task_completed",
+            Event::CardPresented { .. } => "card_presented",
+            Event::CardInteracted { .. } => "card_interacted",
             Event::Error { .. } => "error",
         })
         .collect()

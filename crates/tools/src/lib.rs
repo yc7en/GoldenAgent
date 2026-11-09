@@ -21,6 +21,7 @@ mod glob;
 mod grep;
 mod list_dir;
 mod manage_task;
+mod present_card;
 mod read_file;
 pub mod skill;
 mod walk;
@@ -36,6 +37,7 @@ pub use apply_patch::MAX_EDITS;
 pub use bash::{DEFAULT_TIMEOUT_SECS, MAX_OUTPUT_BYTES, MAX_TIMEOUT_SECS};
 pub use list_dir::MAX_ENTRIES;
 pub use lsp::{LspClient, LspDefinition, LspDiagnostics, LspManager, LspReferences, LspRename};
+pub use present_card::PresentCard;
 pub use read_file::{DEFAULT_LIMIT, MAX_READ_BYTES};
 pub use spill::{InspectSpill, SpillManager, DEFAULT_SPILL_THRESHOLD_BYTES, SPILL_DIR_NAME};
 pub use task_manager::TaskManager;
@@ -189,6 +191,7 @@ impl Registry {
         registry.register(Arc::new(lsp::LspReferences));
         registry.register(Arc::new(lsp::LspDiagnostics));
         registry.register(Arc::new(lsp::LspRename));
+        registry.register(Arc::new(present_card::PresentCard));
         registry
     }
 
