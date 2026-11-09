@@ -477,7 +477,17 @@ pub fn derive_title(text: &str) -> Option<String> {
         if line.is_empty() {
             continue;
         }
-        // 坏行直接跳过：标题是"锦上添花"，不该因为一行坏 JSON 就整个列表报错。
+        // 1. 支持 v2 SessionEvent
+        if let Ok(event) = serde_json::from_str::<goldenagent_core::SessionEvent>(line) {
+            if let goldenagent_core::SessionEvent::UserPrompt { text, .. } = event {
+                let body = text.trim();
+                if !body.is_empty() {
+                    return Some(shorten(body));
+                }
+            }
+            continue;
+        }
+        // 2. 兼容 v1 Message
         let Ok(message) = serde_json::from_str::<Message>(line) else {
             continue;
         };
@@ -569,7 +579,7 @@ fn now_ms() -> u64 {
     system_ms(SystemTime::now())
 }
 
-/// 扫一份 JSONL，返回所有命中位置。逐行解析，坏行跳过。
+/// 扫一份 JSONL，返回所有命中位置。逐行解析，坏行跳过。支持 v2 SessionEvent 与 v1 Message。
 fn search_text(text: &str, needle_lower: &str) -> Vec<SearchHit> {
     let needle_chars = needle_lower.chars().count();
     let mut hits = Vec::new();
@@ -579,6 +589,41 @@ fn search_text(text: &str, needle_lower: &str) -> Vec<SearchHit> {
         if line.is_empty() {
             continue;
         }
+
+        // 1. 尝试 v2 SessionEvent
+        if let Ok(event) = serde_json::from_str::<goldenagent_core::SessionEvent>(line) {
+            let (role, haystack) = match event {
+                goldenagent_core::SessionEvent::UserPrompt { text, .. } => ("user", text),
+                goldenagent_core::SessionEvent::AssistantThinking { thought, .. } => {
+                    ("assistant", thought)
+                }
+                goldenagent_core::SessionEvent::AssistantResponse { text, .. } => {
+                    ("assistant", text)
+                }
+                goldenagent_core::SessionEvent::ToolCall { name, input, .. } => {
+                    ("assistant", format!("{name} {input}"))
+                }
+                goldenagent_core::SessionEvent::ToolResult { output, .. } => ("user", output),
+                goldenagent_core::SessionEvent::CompactionCheckpoint { summary, .. } => {
+                    ("assistant", summary)
+                }
+                _ => continue,
+            };
+            if let Some(at) = locate_ci(&haystack, needle_lower) {
+                hits.push(SearchHit {
+                    msg,
+                    block: 0,
+                    role: role.into(),
+                    snippet: snippet(&haystack, at, needle_chars),
+                });
+                if hits.len() >= HITS_PER_SESSION {
+                    return hits;
+                }
+            }
+            continue;
+        }
+
+        // 2. 尝试 v1 Message
         let Ok(message) = serde_json::from_str::<Message>(line) else {
             continue;
         };

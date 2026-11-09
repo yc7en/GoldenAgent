@@ -8,12 +8,14 @@
 
 mod error;
 mod event;
+mod event_sourcing;
 mod message;
 mod task;
 mod tool;
 
 pub use error::{Error, Result};
 pub use event::{Event, StopReason};
+pub use event_sourcing::{Artifact, ArtifactAction, SessionEvent, UIState};
 pub use message::{ContentBlock, Message, Role, ToolCall, ToolResult};
 pub use task::{TaskInfo, TaskStatus};
 pub use tool::{ToolKind, ToolSpec};
